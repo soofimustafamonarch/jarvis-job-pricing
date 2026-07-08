@@ -1,109 +1,87 @@
 import re
-import sqlite3
 from datetime import datetime
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-
-
-DB_FILE = Path("jarvis.db")
+from supabase import create_client
 
 
 # -----------------------------
-# Database setup
+# Page setup
 # -----------------------------
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            customer TEXT,
-            requirement TEXT NOT NULL,
-            quantity REAL,
-            width_cm REAL,
-            height_cm REAL,
-            thickness_mm REAL,
-            material TEXT,
-            process TEXT,
-            production_method TEXT,
-            vendor TEXT,
-            cost_price REAL,
-            selling_price REAL,
-            profit REAL,
-            margin_percent REAL,
-            markup_percent REAL,
-            area_sqm REAL,
-            notes TEXT
-        )
-        """
-    )
-
-    conn.commit()
-    conn.close()
+st.set_page_config(
+    page_title="Jarvis",
+    page_icon="🧠",
+    layout="centered",
+)
 
 
+# -----------------------------
+# Password protection
+# -----------------------------
+def check_password():
+    if "password_correct" not in st.session_state:
+        st.session_state.password_correct = False
+
+    if st.session_state.password_correct:
+        return True
+
+    st.title("🧠 Jarvis Login")
+    password = st.text_input("Enter password", type="password")
+
+    if st.button("Login"):
+        if password == st.secrets["APP_PASSWORD"]:
+            st.session_state.password_correct = True
+            st.rerun()
+        else:
+            st.error("Wrong password")
+
+    return False
+
+
+if not check_password():
+    st.stop()
+
+
+# -----------------------------
+# Supabase connection
+# -----------------------------
+@st.cache_resource
+def get_supabase_client():
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
+
+
+supabase = get_supabase_client()
+
+
+# -----------------------------
+# Supabase functions
+# -----------------------------
 def save_job(data):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        INSERT INTO jobs (
-            created_at, customer, requirement, quantity,
-            width_cm, height_cm, thickness_mm,
-            material, process, production_method, vendor,
-            cost_price, selling_price, profit,
-            margin_percent, markup_percent, area_sqm, notes
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            data["created_at"],
-            data["customer"],
-            data["requirement"],
-            data["quantity"],
-            data["width_cm"],
-            data["height_cm"],
-            data["thickness_mm"],
-            data["material"],
-            data["process"],
-            data["production_method"],
-            data["vendor"],
-            data["cost_price"],
-            data["selling_price"],
-            data["profit"],
-            data["margin_percent"],
-            data["markup_percent"],
-            data["area_sqm"],
-            data["notes"],
-        ),
-    )
-
-    conn.commit()
-    conn.close()
+    response = supabase.table("jobs").insert(data).execute()
+    return response
 
 
 def load_jobs():
-    conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query("SELECT * FROM jobs ORDER BY id DESC", conn)
-    conn.close()
-    return df
+    response = (
+        supabase.table("jobs")
+        .select("*")
+        .order("id", desc=True)
+        .execute()
+    )
+
+    if not response.data:
+        return pd.DataFrame()
+
+    return pd.DataFrame(response.data)
 
 
 # -----------------------------
 # Simple requirement parser
 # -----------------------------
 def parse_requirement(text):
-    """
-    This is a basic parser.
-    Later we can upgrade this into a proper AI-style reader.
-    """
-
     result = {
         "quantity": 0.0,
         "width_cm": 0.0,
@@ -224,9 +202,8 @@ def parse_requirement(text):
 
     result["process"] = ", ".join(processes)
 
-    # Production method suggestion
-    # Current known rule:
-    # In-house: Latex + UV
+    # Current known business rule:
+    # In-house: Latex printing and UV printing
     # Everything else: outsourced by default
     if processes:
         in_house_parts = {"Latex Printing", "UV Printing"}
@@ -243,9 +220,6 @@ def parse_requirement(text):
 
 
 def clean_number(value):
-    """
-    Store 0 as blank/None when the user doesn't know the value.
-    """
     if value == 0 or value == 0.0:
         return None
     return value
@@ -272,18 +246,10 @@ def calculate_area_sqm(width_cm, height_cm, quantity):
 
 
 # -----------------------------
-# Streamlit app
+# App UI
 # -----------------------------
-st.set_page_config(
-    page_title="Jarvis",
-    page_icon="🧠",
-    layout="centered",
-)
-
-init_db()
-
 st.title("🧠 Jarvis")
-st.caption("Job Pricing Data Collector v0.0")
+st.caption("Job Pricing Data Collector Cloud v0.1")
 
 menu = st.sidebar.radio(
     "Menu",
@@ -354,14 +320,14 @@ if menu == "Add Job":
 
         process = st.text_input("Process", value=parsed["process"])
 
+        production_options = ["In-house", "Outsourced", "Mixed", "Unknown"]
+
         production_method = st.selectbox(
             "Production method",
-            ["In-house", "Outsourced", "Mixed", "Unknown"],
-            index=["In-house", "Outsourced", "Mixed", "Unknown"].index(
-                parsed["production_method"]
-                if parsed["production_method"] in ["In-house", "Outsourced", "Mixed", "Unknown"]
-                else "Unknown"
-            ),
+            production_options,
+            index=production_options.index(parsed["production_method"])
+            if parsed["production_method"] in production_options
+            else 1,
         )
 
         vendor = st.text_input("Vendor / supplier optional")
@@ -404,39 +370,43 @@ if menu == "Add Job":
             area_sqm = calculate_area_sqm(width_cm, height_cm, quantity)
 
             job_data = {
-                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "customer": customer.strip(),
+                "created_at": datetime.now().isoformat(),
+                "customer": customer.strip() or None,
                 "requirement": requirement.strip(),
                 "quantity": clean_number(quantity),
                 "width_cm": clean_number(width_cm),
                 "height_cm": clean_number(height_cm),
                 "thickness_mm": clean_number(thickness_mm),
-                "material": material.strip(),
-                "process": process.strip(),
+                "material": material.strip() or None,
+                "process": process.strip() or None,
                 "production_method": production_method,
-                "vendor": vendor.strip(),
+                "vendor": vendor.strip() or None,
                 "cost_price": clean_number(cost_price),
                 "selling_price": clean_number(selling_price),
                 "profit": profit,
                 "margin_percent": margin_percent,
                 "markup_percent": markup_percent,
                 "area_sqm": area_sqm,
-                "notes": notes.strip(),
+                "notes": notes.strip() or None,
             }
 
-            save_job(job_data)
+            try:
+                save_job(job_data)
+                st.success("Job saved successfully to Supabase.")
 
-            st.success("Job saved successfully.")
+                if profit is not None:
+                    st.info(
+                        f"Profit: {profit:.3f} OMR | "
+                        f"Margin: {margin_percent:.2f}% | "
+                        f"Markup: {markup_percent:.2f}%"
+                    )
 
-            if profit is not None:
-                st.info(
-                    f"Profit: {profit:.3f} OMR | "
-                    f"Margin: {margin_percent:.2f}% | "
-                    f"Markup: {markup_percent:.2f}%"
-                )
+                if area_sqm is not None:
+                    st.info(f"Total area: {area_sqm:.3f} sqm")
 
-            if area_sqm is not None:
-                st.info(f"Total area: {area_sqm:.3f} sqm")
+            except Exception as e:
+                st.error("Could not save job to Supabase.")
+                st.exception(e)
 
 
 # -----------------------------
@@ -445,12 +415,17 @@ if menu == "Add Job":
 elif menu == "View Jobs":
     st.subheader("Saved Jobs")
 
-    df = load_jobs()
+    try:
+        df = load_jobs()
 
-    if df.empty:
-        st.warning("No jobs saved yet.")
-    else:
-        st.dataframe(df, use_container_width=True)
+        if df.empty:
+            st.warning("No jobs saved yet.")
+        else:
+            st.dataframe(df, use_container_width=True)
+
+    except Exception as e:
+        st.error("Could not load jobs from Supabase.")
+        st.exception(e)
 
 
 # -----------------------------
@@ -461,25 +436,30 @@ elif menu == "Search Jobs":
 
     search = st.text_input("Search by customer, requirement, material, process, vendor, or notes")
 
-    df = load_jobs()
+    try:
+        df = load_jobs()
 
-    if df.empty:
-        st.warning("No jobs saved yet.")
-    elif search.strip():
-        search_lower = search.lower()
+        if df.empty:
+            st.warning("No jobs saved yet.")
+        elif search.strip():
+            search_lower = search.lower()
 
-        filtered = df[
-            df.apply(
-                lambda row: search_lower
-                in " ".join([str(value).lower() for value in row.values]),
-                axis=1,
-            )
-        ]
+            filtered = df[
+                df.apply(
+                    lambda row: search_lower
+                    in " ".join([str(value).lower() for value in row.values]),
+                    axis=1,
+                )
+            ]
 
-        st.write(f"Found {len(filtered)} result(s).")
-        st.dataframe(filtered, use_container_width=True)
-    else:
-        st.info("Type something to search.")
+            st.write(f"Found {len(filtered)} result(s).")
+            st.dataframe(filtered, use_container_width=True)
+        else:
+            st.info("Type something to search.")
+
+    except Exception as e:
+        st.error("Could not search jobs.")
+        st.exception(e)
 
 
 # -----------------------------
@@ -488,19 +468,24 @@ elif menu == "Search Jobs":
 elif menu == "Export Data":
     st.subheader("Export Data")
 
-    df = load_jobs()
+    try:
+        df = load_jobs()
 
-    if df.empty:
-        st.warning("No jobs saved yet.")
-    else:
-        csv_data = df.to_csv(index=False).encode("utf-8")
+        if df.empty:
+            st.warning("No jobs saved yet.")
+        else:
+            csv_data = df.to_csv(index=False).encode("utf-8")
 
-        st.download_button(
-            label="Download CSV",
-            data=csv_data,
-            file_name="jarvis_jobs_export.csv",
-            mime="text/csv",
-        )
+            st.download_button(
+                label="Download CSV",
+                data=csv_data,
+                file_name="jarvis_jobs_export.csv",
+                mime="text/csv",
+            )
 
-        st.write("Preview:")
-        st.dataframe(df, use_container_width=True)
+            st.write("Preview:")
+            st.dataframe(df, use_container_width=True)
+
+    except Exception as e:
+        st.error("Could not export jobs.")
+        st.exception(e)
