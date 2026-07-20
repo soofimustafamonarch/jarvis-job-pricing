@@ -1,5 +1,6 @@
-import re
+import io
 import math
+import re
 from datetime import datetime
 
 import pandas as pd
@@ -7,30 +8,29 @@ import streamlit as st
 from supabase import create_client
 
 
-# -----------------------------
-# Page setup
-# -----------------------------
+# =========================================================
+# Page and login
+# =========================================================
+
 st.set_page_config(
     page_title="Jarvis",
-    page_icon="🧠",
+    page_icon="J",
     layout="centered",
 )
 
 
-# -----------------------------
-# Password protection
-# -----------------------------
 def check_password():
-    if "password_correct" not in st.session_state:
-        st.session_state.password_correct = False
-
-    if st.session_state.password_correct:
+    if st.session_state.get("password_correct"):
         return True
 
-    st.title("🧠 Jarvis Login")
-    password = st.text_input("Enter password", type="password")
+    st.title("Jarvis Login")
 
-    if st.button("Login"):
+    password = st.text_input(
+        "Enter password",
+        type="password",
+    )
+
+    if st.button("Login", type="primary"):
         if password == st.secrets["APP_PASSWORD"]:
             st.session_state.password_correct = True
             st.rerun()
@@ -44,60 +44,26 @@ if not check_password():
     st.stop()
 
 
-# -----------------------------
-# Supabase connection
-# -----------------------------
+# =========================================================
+# Supabase
+# =========================================================
+
 @st.cache_resource
 def get_supabase_client():
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
-    return create_client(url, key)
+    return create_client(
+        st.secrets["SUPABASE_URL"],
+        st.secrets["SUPABASE_KEY"],
+    )
 
 
 supabase = get_supabase_client()
 
 
-# -----------------------------
-# Helper functions
-# -----------------------------
-def to_float(value, default=0.0):
-    """
-    Safely converts values from Supabase/Pandas into float.
-    Handles None and NaN.
-    """
-    try:
-        if value is None or pd.isna(value):
-            return default
-        return float(value)
-    except Exception:
-        return default
-
-
-def clean_number(value):
-    """
-    Converts 0 or blank numbers into None before saving.
-    """
-    if value is None:
-        return None
-
-    try:
-        value = float(value)
-    except Exception:
-        return None
-
-    if math.isnan(value) or math.isinf(value):
-        return None
-
-    if value == 0:
-        return None
-
-    return value
-
+# =========================================================
+# General helper functions
+# =========================================================
 
 def safe_text(value):
-    """
-    Converts empty text into None.
-    """
     if value is None:
         return None
 
@@ -107,1207 +73,1437 @@ def safe_text(value):
     except Exception:
         pass
 
-    value = str(value).strip()
-    return value if value else None
+    text = str(value).strip()
+    return text or None
 
 
-def sanitize_value(value):
-    """
-    Supabase/JSON cannot accept NaN or Infinity.
-    This converts empty/invalid numeric values into None.
-    """
-    if value is None:
+def safe_number(value):
+    try:
+        if value is None or pd.isna(value):
+            return None
+
+        number = float(value)
+
+        if math.isnan(number) or math.isinf(number):
+            return None
+
+        return number
+
+    except Exception:
         return None
 
-    try:
-        if pd.isna(value):
-            return None
-    except Exception:
-        pass
 
-    if isinstance(value, float):
-        if math.isnan(value) or math.isinf(value):
-            return None
-
-    return value
+def display_text(value):
+    return safe_text(value) or ""
 
 
-def sanitize_dict(data):
+def display_number(value):
+    return safe_number(value) or 0.0
+
+
+def parse_measurement(number, unit, output_unit="cm"):
     """
-    Cleans a full dictionary before sending it to Supabase.
+    Convert mm, cm or metres into the requested output unit.
     """
-    return {key: sanitize_value(value) for key, value in data.items()}
+
+    number = float(number)
+    unit = (unit or "cm").lower()
+
+    if unit == "mm":
+        metres = number / 1000
+
+    elif unit == "cm":
+        metres = number / 100
+
+    else:
+        metres = number
+
+    if output_unit == "mm":
+        return metres * 1000
+
+    if output_unit == "cm":
+        return metres * 100
+
+    return metres
 
 
-def parse_measurement(value, output_unit="cm", default_unit="cm"):
+# =========================================================
+# Requirement splitting
+# =========================================================
+
+def split_requirement(text):
     """
-    Converts typed measurements like:
-    10cm, 100mm, 1m, 1mtr, 1.22m
+    Split one paragraph into possible separate jobs.
 
-    output_unit can be:
-    - "cm"
-    - "m"
-    - "mm"
-
-    If user types only a number, default_unit is used.
+    Recognized separators:
+    - New line
+    - +
+    - ;
+    - &
+    - 'and' when followed by another quantity
     """
-    if value is None:
-        return 0.0
 
-    text = str(value).strip().lower().replace(",", ".")
+    cleaned = re.sub(r"\r\n?", "\n", text.strip())
 
-    if not text:
-        return 0.0
+    parts = re.split(
+        r"\s*(?:"
+        r"\n+"
+        r"|\+"
+        r"|;"
+        r"|\s&\s"
+        r"|\band\b(?=\s*(?:qty\s*[:\-]?\s*)?\d+)"
+        r")\s*",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
 
-    match = re.match(
-        r"^\s*(\d+(?:\.\d+)?)\s*(mm|millimeter|millimetre|cm|centimeter|centimetre|m|meter|metre|mtr)?\s*$",
+    return [
+        part.strip(" ,.-")
+        for part in parts
+        if part.strip(" ,.-")
+    ]
+
+
+# =========================================================
+# Requirement detection
+# =========================================================
+
+def detect_quantity_and_unit(text):
+    """
+    Detect quantity and how the finished product was sold.
+    """
+
+    patterns = [
+        (
+            r"(?:qty|quantity)\s*[:\-]?\s*"
+            r"(\d+(?:\.\d+)?)\s*(pcs?|nos?|pieces?)?",
+            "pcs",
+        ),
+        (
+            r"(\d+(?:\.\d+)?)\s*(pcs?|nos?|pieces?)\b",
+            "pcs",
+        ),
+        (
+            r"(\d+(?:\.\d+)?)\s*(sqm|sq\.?\s*m|m2|m²)\b",
+            "sqm",
+        ),
+        (
+            r"(\d+(?:\.\d+)?)\s*(rolls?)\b",
+            "roll",
+        ),
+        (
+            r"(\d+(?:\.\d+)?)\s*(sheets?)\b",
+            "sheet",
+        ),
+        (
+            r"(\d+(?:\.\d+)?)\s*"
+            r"(?:running\s*)?(?:metres?|meters?|mtrs?|rm)\b",
+            "running metre",
+        ),
+    ]
+
+    for pattern, normalized_unit in patterns:
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        if match:
+            return float(match.group(1)), normalized_unit
+
+    return None, "job"
+
+
+def detect_size(text):
+    """
+    Detect sizes such as:
+    10x10cm
+    100mm x 100mm
+    1m x 2m
+    1mtr x 2mtr
+    """
+
+    match = re.search(
+        r"(\d+(?:\.\d+)?)\s*"
+        r"(mm|cm|m|mtr|metre|meter)?\s*"
+        r"[x×]\s*"
+        r"(\d+(?:\.\d+)?)\s*"
+        r"(mm|cm|m|mtr|metre|meter)?",
         text,
+        flags=re.IGNORECASE,
     )
 
     if not match:
-        return 0.0
+        return None, None
 
-    number = float(match.group(1))
-    unit = match.group(2) or default_unit
+    width_number = match.group(1)
+    width_unit = match.group(2)
 
-    # Convert input into meters first
-    if unit in ["mm", "millimeter", "millimetre"]:
-        meters = number / 1000
-    elif unit in ["cm", "centimeter", "centimetre"]:
-        meters = number / 100
-    elif unit in ["m", "meter", "metre", "mtr"]:
-        meters = number
-    else:
-        meters = number
+    height_number = match.group(3)
+    height_unit = match.group(4)
 
-    # Convert meters into requested output
-    if output_unit == "m":
-        return meters
-    elif output_unit == "cm":
-        return meters * 100
-    elif output_unit == "mm":
-        return meters * 1000
+    # If only one unit is written, use it for both measurements.
+    width_unit = width_unit or height_unit or "cm"
+    height_unit = height_unit or width_unit
 
-    return meters
+    metre_units = {
+        "m",
+        "mtr",
+        "metre",
+        "meter",
+    }
+
+    if width_unit.lower() in metre_units:
+        width_unit = "m"
+
+    if height_unit.lower() in metre_units:
+        height_unit = "m"
+
+    width_cm = parse_measurement(
+        width_number,
+        width_unit,
+        output_unit="cm",
+    )
+
+    height_cm = parse_measurement(
+        height_number,
+        height_unit,
+        output_unit="cm",
+    )
+
+    return width_cm, height_cm
 
 
-def format_measurement(value, unit):
+def detect_thickness(text):
     """
-    Makes saved numeric values show nicely in edit screens.
-    Example: 14 + cm = 14cm
+    Detect thickness such as 3mm or thickness 3mm.
     """
-    try:
-        if value is None or pd.isna(value):
-            return ""
 
-        value = float(value)
+    match = re.search(
+        r"(?:thickness\s*[:\-]?\s*)?"
+        r"(\d+(?:\.\d+)?)\s*mm\s*"
+        r"(?:thick|thickness)?",
+        text,
+        flags=re.IGNORECASE,
+    )
 
-        if value == 0:
-            return ""
+    if match:
+        return float(match.group(1))
 
-        return f"{value:g}{unit}"
-    except Exception:
-        return ""
-
-
-def calculate_profit(cost_price, selling_price):
-    profit = None
-    margin_percent = None
-    markup_percent = None
-
-    if selling_price > 0 and cost_price > 0:
-        profit = selling_price - cost_price
-        margin_percent = (profit / selling_price) * 100
-        markup_percent = (profit / cost_price) * 100
-
-    return profit, margin_percent, markup_percent
-
-
-def calculate_area_sqm(width_cm, height_cm, quantity):
-    if width_cm > 0 and height_cm > 0 and quantity > 0:
-        single_area = (width_cm / 100) * (height_cm / 100)
-        return single_area * quantity
     return None
 
 
-def calculate_sticker_roll_cost(
-    roll_width_m,
-    roll_length_m,
-    roll_cost_omr,
-    vat_percent,
-    extra_cost_omr,
-    wastage_percent,
-):
-    landed_roll_cost = roll_cost_omr + (roll_cost_omr * vat_percent / 100) + extra_cost_omr
-    total_area = roll_width_m * roll_length_m
-    usable_area = total_area * (1 - wastage_percent / 100)
-
-    if usable_area <= 0:
-        cost_per_sqm = 0
-    else:
-        cost_per_sqm = landed_roll_cost / usable_area
-
-    return landed_roll_cost, total_area, usable_area, cost_per_sqm
-
-
-def parse_requirement(text):
+def detect_materials(text):
     """
-    Basic reader for requirement text.
-
-    Examples:
-    - 100pcs mactac sticker 10x10cm latex print
-    - 100pcs mactac sticker 10cm x 10cm latex print
-    - 100pcs mactac sticker 100mm x 100mm latex print
-    - engraved plates 4000nos 140x80mm in 3mm aluminium plates
+    Detect one or more materials mentioned in a job.
     """
-    result = {
-        "quantity": 0.0,
-        "width_cm": 0.0,
-        "height_cm": 0.0,
-        "thickness_mm": 0.0,
-        "material": "",
-        "process": "",
-        "production_method": "Outsourced",
-    }
 
-    if not text:
-        return result
+    aliases = [
+        (
+            "Mactac sticker",
+            ["mactac", "matac"],
+        ),
+        (
+            "Politape sticker",
+            ["politape"],
+        ),
+        (
+            "3M sticker",
+            ["3m"],
+        ),
+        (
+            "ACP",
+            ["acp"],
+        ),
+        (
+            "Aluminium",
+            ["aluminium", "aluminum"],
+        ),
+        (
+            "Acrylic",
+            ["acrylic"],
+        ),
+        (
+            "PVC",
+            ["pvc"],
+        ),
+        (
+            "Foam board",
+            ["foam board", "foam"],
+        ),
+        (
+            "Sticker",
+            ["sticker", "vinyl"],
+        ),
+        (
+            "Paper",
+            ["paper"],
+        ),
+    ]
+
+    lower = text.lower()
+    found = []
+
+    for name, words in aliases:
+        matched = any(
+            re.search(
+                rf"\b{re.escape(word)}\b",
+                lower,
+            )
+            for word in words
+        )
+
+        if not matched:
+            continue
+
+        # Avoid adding generic Sticker after a specific sticker.
+        if name == "Sticker":
+            specific_sticker_exists = any(
+                "sticker" in item.lower()
+                for item in found
+            )
+
+            if specific_sticker_exists:
+                continue
+
+        found.append(name)
+
+    return ", ".join(found)
+
+
+def detect_processes(text):
+    """
+    Detect processes mentioned in the requirement.
+    """
+
+    rules = [
+        (
+            "Latex printing",
+            ["latex"],
+        ),
+        (
+            "UV printing",
+            ["uv print", "uv printing"],
+        ),
+        (
+            "Engraving",
+            ["engrave", "engraved", "engraving"],
+        ),
+        (
+            "Cutting",
+            ["cut", "cutting"],
+        ),
+        (
+            "Lamination",
+            ["laminate", "lamination"],
+        ),
+        (
+            "Installation",
+            ["install", "installation", "fixing"],
+        ),
+    ]
+
+    lower = text.lower()
+    found = []
+
+    for name, words in rules:
+        if any(word in lower for word in words):
+            found.append(name)
+
+    return ", ".join(found)
+
+
+def detect_product(text):
+    """
+    Detect the finished/customer-facing product.
+
+    Example:
+    ACP + sticker + latex printing may still be sold as one signboard.
+    """
+
+    products = [
+        (
+            "Signboard",
+            ["signboard", "sign board"],
+        ),
+        (
+            "Sticker",
+            ["sticker", "vinyl"],
+        ),
+        (
+            "Engraved plate",
+            ["engraved plate", "engraving plate"],
+        ),
+        (
+            "Business card",
+            ["business card"],
+        ),
+        (
+            "Letterhead",
+            ["letterhead"],
+        ),
+        (
+            "Banner",
+            ["banner", "flex"],
+        ),
+        (
+            "Nameplate",
+            ["nameplate", "name plate"],
+        ),
+    ]
 
     lower = text.lower()
 
-    # Quantity examples:
-    # 4000nos, 4000 nos, 4000pcs, 4000 pcs, qty 4000
-    qty_patterns = [
-        r"(\d+(?:\.\d+)?)\s*(?:nos|no|pcs|pc|pieces|qty)",
-        r"(?:qty|quantity)\s*[:\-]?\s*(\d+(?:\.\d+)?)",
+    for product, words in products:
+        if any(word in lower for word in words):
+            return product
+
+    # If unknown, keep part of the original description.
+    return text[:80].strip()
+
+
+def detect_components(
+    text,
+    product,
+    materials,
+    processes,
+):
+    """
+    Suggest internal components separately from the sold product.
+    """
+
+    components = [
+        part.strip()
+        for part in materials.split(",")
+        if part.strip()
     ]
 
-    for pattern in qty_patterns:
-        match = re.search(pattern, lower)
-        if match:
-            result["quantity"] = float(match.group(1))
-            break
+    # For composite finished products, processes can also be internal work.
+    if product == "Signboard":
+        process_list = [
+            part.strip()
+            for part in processes.split(",")
+            if part.strip()
+        ]
 
-    # Size examples:
-    # 140x80mm
-    # 10cm x 10cm
-    # 100mm x 100mm
-    # 1m x 1m
-    size_match = re.search(
-        r"(\d+(?:\.\d+)?)\s*(mm|cm|m|mtr|meter|metre)?\s*[x×]\s*(\d+(?:\.\d+)?)\s*(mm|cm|m|mtr|meter|metre)?",
-        lower,
+        for process in process_list:
+            if process not in components:
+                components.append(process)
+
+    return ", ".join(components)
+
+
+def detect_production_method(process):
+    """
+    Current known business rule:
+    Latex and UV printing are in-house.
+    Other processes are outsourced by default.
+    """
+
+    if not process:
+        return "Unknown"
+
+    process_set = {
+        part.strip()
+        for part in process.split(",")
+        if part.strip()
+    }
+
+    in_house_processes = {
+        "Latex printing",
+        "UV printing",
+    }
+
+    if process_set.issubset(in_house_processes):
+        return "In-house"
+
+    if process_set.intersection(in_house_processes):
+        return "Mixed"
+
+    return "Outsourced"
+
+
+def parse_job_item(text):
+    quantity, selling_unit = detect_quantity_and_unit(text)
+    width_cm, height_cm = detect_size(text)
+
+    material = detect_materials(text)
+    process = detect_processes(text)
+    product = detect_product(text)
+
+    components = detect_components(
+        text,
+        product,
+        material,
+        process,
     )
 
-    if size_match:
-        width_number = size_match.group(1)
-        width_unit = size_match.group(2)
+    review_status = "Ready"
 
-        height_number = size_match.group(3)
-        height_unit = size_match.group(4)
+    if not quantity or not product:
+        review_status = "Needs review"
 
-        # If unit only written at the end, apply it to both.
-        final_width_unit = width_unit or height_unit or "cm"
-        final_height_unit = height_unit or width_unit or "cm"
+    return {
+        "description": text,
+        "product_name": product,
+        "quantity": quantity,
+        "selling_unit": selling_unit,
+        "width_cm": width_cm,
+        "height_cm": height_cm,
+        "thickness_mm": detect_thickness(text),
+        "material": material,
+        "process": process,
+        "components": components,
+        "production_method": detect_production_method(process),
+        "cost_price": None,
+        "selling_price": None,
+        "review_status": review_status,
+    }
 
-        result["width_cm"] = parse_measurement(
-            f"{width_number}{final_width_unit}",
-            output_unit="cm",
-            default_unit="cm",
-        )
 
-        result["height_cm"] = parse_measurement(
-            f"{height_number}{final_height_unit}",
-            output_unit="cm",
-            default_unit="cm",
-        )
+def analyse_requirement(text):
+    parts = split_requirement(text)
 
-    # Thickness examples:
-    # 3mm, 3 mm, 6mm thickness
-    thickness_match = re.search(r"(\d+(?:\.\d+)?)\s*mm\s*(?:thick|thickness)?", lower)
-    if thickness_match:
-        result["thickness_mm"] = float(thickness_match.group(1))
-
-    # Material detection
-    materials = [
-        "business card",
-        "letterhead",
-        "acrylic",
-        "aluminium",
-        "aluminum",
-        "sticker",
-        "vinyl",
-        "mactac",
-        "matac",
-        "3m",
-        "acp",
-        "foam",
-        "pvc",
-        "banner",
-        "flex",
-        "paper",
+    rows = [
+        parse_job_item(part)
+        for part in parts
     ]
 
-    for material in materials:
-        if material in lower:
-            if material == "aluminum":
-                result["material"] = "Aluminium"
-            elif material in ["matac", "mactac"]:
-                result["material"] = "Mactac Sticker"
-            elif material == "3m":
-                result["material"] = "3M"
-            else:
-                result["material"] = material.title()
-            break
-
-    # Process detection
-    processes = []
-
-    if "latex" in lower:
-        processes.append("Latex Printing")
-
-    if "uv" in lower:
-        processes.append("UV Printing")
-
-    if "engrave" in lower or "engraved" in lower or "engraving" in lower:
-        processes.append("Engraving")
-
-    if "cut" in lower or "cutting" in lower:
-        processes.append("Cutting")
-
-    if "business card" in lower or "business cards" in lower:
-        processes.append("Business Cards")
-
-    if "letterhead" in lower:
-        processes.append("Letterhead")
-
-    if "install" in lower or "fixing" in lower:
-        processes.append("Installation")
-
-    if "lamination" in lower or "laminate" in lower:
-        processes.append("Lamination")
-
-    result["process"] = ", ".join(processes)
-
-    # Current business rule:
-    # In-house: Latex printing and UV printing
-    # Everything else: outsourced by default
-    if processes:
-        in_house_parts = {"Latex Printing", "UV Printing"}
-        process_set = set(processes)
-
-        if process_set.issubset(in_house_parts):
-            result["production_method"] = "In-house"
-        elif process_set.intersection(in_house_parts):
-            result["production_method"] = "Mixed"
-        else:
-            result["production_method"] = "Outsourced"
-
-    return result
+    return pd.DataFrame(rows)
 
 
-# -----------------------------
-# Supabase functions - jobs
-# -----------------------------
-def save_job(data):
-    clean_data = sanitize_dict(data)
-    return supabase.table("jobs").insert(clean_data).execute()
-
+# =========================================================
+# Supabase job functions
+# =========================================================
 
 def load_jobs():
-    response = supabase.table("jobs").select("*").order("id", desc=True).execute()
-
-    if not response.data:
-        return pd.DataFrame()
-
-    return pd.DataFrame(response.data)
-
-
-def update_job(job_id, data):
-    clean_data = sanitize_dict(data)
-    return supabase.table("jobs").update(clean_data).eq("id", job_id).execute()
-
-
-def delete_job(job_id):
-    return supabase.table("jobs").delete().eq("id", job_id).execute()
-
-
-# -----------------------------
-# Supabase functions - sticker items
-# -----------------------------
-def save_sticker_item(data):
-    clean_data = sanitize_dict(data)
-    return supabase.table("sticker_items").insert(clean_data).execute()
-
-
-def load_sticker_items():
     response = (
-        supabase.table("sticker_items")
+        supabase
+        .table("jobs")
         .select("*")
         .order("id", desc=True)
         .execute()
     )
 
-    if not response.data:
-        return pd.DataFrame()
-
-    return pd.DataFrame(response.data)
+    return pd.DataFrame(response.data or [])
 
 
-def update_sticker_item(item_id, data):
-    clean_data = sanitize_dict(data)
-    return supabase.table("sticker_items").update(clean_data).eq("id", item_id).execute()
+def insert_jobs(rows):
+    return (
+        supabase
+        .table("jobs")
+        .insert(rows)
+        .execute()
+    )
 
 
-def delete_sticker_item(item_id):
-    return supabase.table("sticker_items").delete().eq("id", item_id).execute()
+def update_job(job_id, data):
+    return (
+        supabase
+        .table("jobs")
+        .update(data)
+        .eq("id", job_id)
+        .execute()
+    )
 
 
-# -----------------------------
-# App UI
-# -----------------------------
-st.title("🧠 Jarvis")
-st.caption("Job Pricing Data Collector Cloud v0.2.1")
+def delete_job(job_id):
+    return (
+        supabase
+        .table("jobs")
+        .delete()
+        .eq("id", job_id)
+        .execute()
+    )
+
+
+# =========================================================
+# Tally file helper functions
+# =========================================================
+
+def read_uploaded_table(uploaded_file):
+    """
+    Read CSV or XLSX files.
+
+    Excel files may contain multiple sheets.
+    """
+
+    raw = uploaded_file.getvalue()
+    suffix = uploaded_file.name.lower().rsplit(".", 1)[-1]
+
+    if suffix == "csv":
+        encodings = [
+            "utf-8-sig",
+            "utf-8",
+            "cp1252",
+        ]
+
+        last_error = None
+
+        for encoding in encodings:
+            try:
+                dataframe = pd.read_csv(
+                    io.BytesIO(raw),
+                    encoding=encoding,
+                )
+
+                return {
+                    "CSV": dataframe,
+                }
+
+            except UnicodeDecodeError as error:
+                last_error = error
+
+        raise ValueError(
+            "Could not read the CSV encoding."
+        ) from last_error
+
+    workbook = pd.ExcelFile(
+        io.BytesIO(raw)
+    )
+
+    sheets = {}
+
+    for sheet_name in workbook.sheet_names:
+        sheets[sheet_name] = pd.read_excel(
+            workbook,
+            sheet_name=sheet_name,
+        )
+
+    return sheets
+
+
+def guess_report_type(columns):
+    """
+    Preliminary report detection.
+
+    This will be improved after seeing real Tally exports.
+    """
+
+    names = " ".join(
+        str(column).lower()
+        for column in columns
+    )
+
+    if any(
+        word in names
+        for word in [
+            "supplier",
+            "purchase",
+            "purchase rate",
+        ]
+    ):
+        return "Purchase"
+
+    if any(
+        word in names
+        for word in [
+            "customer",
+            "sales",
+            "selling rate",
+        ]
+    ):
+        return "Sales"
+
+    if any(
+        word in names
+        for word in [
+            "inward",
+            "outward",
+            "closing quantity",
+            "stock movement",
+        ]
+    ):
+        return "Stock movement"
+
+    return "Unknown — select manually later"
+
+
+# =========================================================
+# Main app
+# =========================================================
+
+st.title("Jarvis")
+st.caption("Peter data collector v0.3 preview")
 
 menu = st.sidebar.radio(
     "Menu",
     [
-        "Add Job",
-        "View Jobs",
-        "Edit/Delete Jobs",
-        "Sticker Item Master",
-        "Edit/Delete Sticker Items",
-        "Search Jobs",
-        "Export Data",
+        "Add job records",
+        "Tally file preview",
+        "View records",
+        "Edit/Delete record",
+        "Export data",
     ],
 )
 
 
-# -----------------------------
-# Add Job
-# -----------------------------
-if menu == "Add Job":
-    st.subheader("Add New Job")
+# =========================================================
+# Add job records
+# =========================================================
 
-    requirement = st.text_area(
-        "Job requirement",
-        placeholder="Example: 100pcs mactac sticker 10cm x 10cm latex print",
-        height=100,
+if menu == "Add job records":
+    st.subheader("Add job records")
+
+    st.write(
+        "Enter one or several jobs. Peter will split them "
+        "and let you review every row before saving."
     )
 
-    parsed = parse_requirement(requirement)
+    requirement = st.text_area(
+        "Requirement",
+        height=130,
+        placeholder=(
+            "Example: 100pcs Mactac sticker 10x10cm latex print "
+            "+ 2 ACP signboards 120x60cm with sticker"
+        ),
+    )
 
-    with st.expander("Auto-detected details", expanded=True):
-        st.write(f"Quantity: **{parsed['quantity'] or 'Not detected'}**")
-        st.write(
-            f"Size: **{parsed['width_cm'] or 'Not detected'} x {parsed['height_cm'] or 'Not detected'} cm**"
-        )
-        st.write(f"Thickness: **{parsed['thickness_mm'] or 'Not detected'} mm**")
-        st.write(f"Material: **{parsed['material'] or 'Not detected'}**")
-        st.write(f"Process: **{parsed['process'] or 'Not detected'}**")
-        st.write(f"Suggested production: **{parsed['production_method']}**")
-
-    sticker_df = load_sticker_items()
-
-    selected_item_id = None
-    selected_item_name = None
-    calculated_material_cost = None
-    recommended_selling_price = None
-    minimum_selling_price = None
-
-    with st.form("job_form"):
-        customer = st.text_input("Customer name optional")
-
-        quantity = st.number_input(
-            "Quantity",
-            min_value=0.0,
-            value=float(parsed["quantity"]),
-            step=1.0,
-        )
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            width_input = st.text_input(
-                "Width",
-                value=format_measurement(parsed["width_cm"], "cm"),
-                placeholder="Example: 10cm, 100mm, 1mtr",
+    if st.button(
+        "Analyse requirement",
+        type="primary",
+    ):
+        if requirement.strip():
+            st.session_state.original_requirement = (
+                requirement.strip()
             )
 
-        with col2:
-            height_input = st.text_input(
-                "Height",
-                value=format_measurement(parsed["height_cm"], "cm"),
-                placeholder="Example: 10cm, 100mm, 1mtr",
+            st.session_state.detected_jobs = (
+                analyse_requirement(requirement)
             )
 
-        thickness_input = st.text_input(
-            "Thickness",
-            value=format_measurement(parsed["thickness_mm"], "mm"),
-            placeholder="Example: 3mm",
-        )
-
-        width_cm = parse_measurement(width_input, output_unit="cm", default_unit="cm")
-        height_cm = parse_measurement(height_input, output_unit="cm", default_unit="cm")
-        thickness_mm = parse_measurement(thickness_input, output_unit="mm", default_unit="mm")
-
-        material = st.text_input("Material", value=parsed["material"])
-        process = st.text_input("Process", value=parsed["process"])
-
-        production_options = ["In-house", "Outsourced", "Mixed", "Unknown"]
-        production_method = st.selectbox(
-            "Production method",
-            production_options,
-            index=production_options.index(parsed["production_method"])
-            if parsed["production_method"] in production_options
-            else 1,
-        )
-
-        vendor = st.text_input("Vendor / supplier optional")
-
-        st.markdown("---")
-        st.markdown("### Sticker calculation optional")
-
-        if sticker_df.empty:
-            st.info("No sticker items added yet. Add one from Sticker Item Master.")
-            sticker_item_choice = "None"
         else:
-            sticker_options = ["None"] + [
-                f"{int(row['id'])} - {row['item_name']}"
-                for _, row in sticker_df.iterrows()
-            ]
-
-            sticker_item_choice = st.selectbox(
-                "Select sticker item",
-                sticker_options,
+            st.warning(
+                "Enter a requirement first."
             )
 
-        job_wastage_percent = st.number_input(
-            "Extra job wastage %",
-            min_value=0.0,
-            value=0.0,
-            step=1.0,
+    detected = st.session_state.get(
+        "detected_jobs"
+    )
+
+    if (
+        isinstance(detected, pd.DataFrame)
+        and not detected.empty
+    ):
+        st.markdown(
+            "#### Review detected jobs"
         )
 
-        if sticker_item_choice != "None" and not sticker_df.empty:
-            selected_item_id = int(sticker_item_choice.split(" - ")[0])
-            item_row = sticker_df[sticker_df["id"] == selected_item_id].iloc[0]
-
-            selected_item_name = item_row["item_name"]
-
-            raw_area_sqm = calculate_area_sqm(width_cm, height_cm, quantity) or 0
-            chargeable_area_sqm = raw_area_sqm * (1 + job_wastage_percent / 100)
-
-            item_cost_per_sqm = to_float(item_row.get("cost_per_sqm"))
-            item_sell_per_sqm = to_float(item_row.get("default_selling_per_sqm"))
-            item_min_sell_per_sqm = to_float(item_row.get("minimum_selling_per_sqm"))
-
-            calculated_material_cost = chargeable_area_sqm * item_cost_per_sqm
-            recommended_selling_price = chargeable_area_sqm * item_sell_per_sqm
-            minimum_selling_price = chargeable_area_sqm * item_min_sell_per_sqm
-
-            st.info(
-                f"Sticker item: {selected_item_name}\n\n"
-                f"Raw area: {raw_area_sqm:.3f} sqm\n\n"
-                f"Chargeable area after wastage: {chargeable_area_sqm:.3f} sqm\n\n"
-                f"Material cost estimate: {calculated_material_cost:.3f} OMR\n\n"
-                f"Recommended selling: {recommended_selling_price:.3f} OMR\n\n"
-                f"Minimum selling: {minimum_selling_price:.3f} OMR"
-            )
-
-        st.markdown("---")
-
-        default_cost = calculated_material_cost if calculated_material_cost else 0.0
-        default_selling = recommended_selling_price if recommended_selling_price else 0.0
-
-        col3, col4 = st.columns(2)
-
-        with col3:
-            cost_price = st.number_input(
-                "Final cost price OMR",
-                min_value=0.0,
-                value=float(default_cost),
-                step=0.100,
-                format="%.3f",
-            )
-
-        with col4:
-            selling_price = st.number_input(
-                "Final selling price OMR",
-                min_value=0.0,
-                value=float(default_selling),
-                step=0.100,
-                format="%.3f",
-            )
-
-        notes = st.text_area(
-            "Notes optional",
-            placeholder="Example: difficult customer, urgent job, customer negotiated, supplier delay, etc.",
+        st.caption(
+            "Correct any wrong values. Add or remove rows "
+            "if Peter split the paragraph incorrectly."
         )
 
-        submitted = st.form_submit_button("Save Job")
+        edited = st.data_editor(
+            detected,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "description": st.column_config.TextColumn(
+                    "Detected description",
+                    required=True,
+                ),
+                "product_name": st.column_config.TextColumn(
+                    "Sold item",
+                    required=True,
+                ),
+                "quantity": st.column_config.NumberColumn(
+                    "Quantity",
+                    min_value=0.0,
+                ),
+                "selling_unit": st.column_config.SelectboxColumn(
+                    "Selling unit",
+                    options=[
+                        "pcs",
+                        "sqm",
+                        "roll",
+                        "sheet",
+                        "running metre",
+                        "job",
+                    ],
+                    required=True,
+                ),
+                "production_method": (
+                    st.column_config.SelectboxColumn(
+                        "Production",
+                        options=[
+                            "In-house",
+                            "Outsourced",
+                            "Mixed",
+                            "Unknown",
+                        ],
+                    )
+                ),
+                "review_status": (
+                    st.column_config.SelectboxColumn(
+                        "Review status",
+                        options=[
+                            "Ready",
+                            "Needs review",
+                        ],
+                    )
+                ),
+            },
+            key="job_review_editor",
+        )
 
-    if submitted:
-        if not requirement.strip():
-            st.error("Job requirement is required.")
-        else:
-            profit, margin_percent, markup_percent = calculate_profit(
-                cost_price, selling_price
+        customer = st.text_input(
+            "Customer name (applies to all rows)"
+        )
+
+        common_notes = st.text_area(
+            "Common notes optional"
+        )
+
+        if st.button(
+            "Save reviewed records",
+            type="primary",
+        ):
+            records = []
+
+            original_requirement = (
+                st.session_state.get(
+                    "original_requirement",
+                    requirement,
+                )
             )
 
-            area_sqm = calculate_area_sqm(width_cm, height_cm, quantity)
+            for _, row in edited.iterrows():
+                description = safe_text(
+                    row.get("description")
+                )
 
-            job_data = {
-                "created_at": datetime.now().isoformat(),
-                "customer": safe_text(customer),
-                "requirement": requirement.strip(),
-                "quantity": clean_number(quantity),
-                "width_cm": clean_number(width_cm),
-                "height_cm": clean_number(height_cm),
-                "thickness_mm": clean_number(thickness_mm),
-                "material": safe_text(material),
-                "process": safe_text(process),
-                "production_method": production_method,
-                "vendor": safe_text(vendor),
-                "cost_price": clean_number(cost_price),
-                "selling_price": clean_number(selling_price),
-                "profit": profit,
-                "margin_percent": margin_percent,
-                "markup_percent": markup_percent,
-                "area_sqm": area_sqm,
-                "notes": safe_text(notes),
-                "item_id": selected_item_id,
-                "item_name": selected_item_name,
-                "calculated_material_cost": calculated_material_cost,
-                "recommended_selling_price": recommended_selling_price,
-                "minimum_selling_price": minimum_selling_price,
-            }
+                product = safe_text(
+                    row.get("product_name")
+                )
 
-            try:
-                save_job(job_data)
-                st.success("Job saved successfully.")
+                if not description or not product:
+                    continue
 
-                if profit is not None:
-                    st.info(
-                        f"Profit: {profit:.3f} OMR | "
-                        f"Margin: {margin_percent:.2f}% | "
-                        f"Markup: {markup_percent:.2f}%"
+                cost = safe_number(
+                    row.get("cost_price")
+                )
+
+                selling = safe_number(
+                    row.get("selling_price")
+                )
+
+                profit = None
+                margin = None
+                markup = None
+
+                if (
+                    cost is not None
+                    and selling is not None
+                ):
+                    profit = selling - cost
+
+                    if selling:
+                        margin = (
+                            profit / selling
+                        ) * 100
+
+                    if cost:
+                        markup = (
+                            profit / cost
+                        ) * 100
+
+                width = safe_number(
+                    row.get("width_cm")
+                )
+
+                height = safe_number(
+                    row.get("height_cm")
+                )
+
+                quantity = safe_number(
+                    row.get("quantity")
+                )
+
+                area = None
+
+                if width and height and quantity:
+                    area = (
+                        (width / 100)
+                        * (height / 100)
+                        * quantity
                     )
 
-                if area_sqm is not None:
-                    st.info(f"Total area: {area_sqm:.3f} sqm")
+                record = {
+                    "created_at": datetime.now().isoformat(),
+                    "customer": safe_text(customer),
+                    "requirement": description,
+                    "quantity": quantity,
+                    "width_cm": width,
+                    "height_cm": height,
+                    "thickness_mm": safe_number(
+                        row.get("thickness_mm")
+                    ),
+                    "material": safe_text(
+                        row.get("material")
+                    ),
+                    "process": safe_text(
+                        row.get("process")
+                    ),
+                    "production_method": (
+                        safe_text(
+                            row.get("production_method")
+                        )
+                        or "Unknown"
+                    ),
+                    "vendor": None,
+                    "cost_price": cost,
+                    "selling_price": selling,
+                    "profit": profit,
+                    "margin_percent": margin,
+                    "markup_percent": markup,
+                    "area_sqm": area,
+                    "notes": safe_text(common_notes),
+                    "product_name": product,
+                    "selling_unit": safe_text(
+                        row.get("selling_unit")
+                    ),
+                    "components": safe_text(
+                        row.get("components")
+                    ),
+                    "record_source": (
+                        "Manual requirement"
+                    ),
+                    "parent_requirement": (
+                        original_requirement
+                    ),
+                    "review_status": (
+                        safe_text(
+                            row.get("review_status")
+                        )
+                        or "Needs review"
+                    ),
+                }
 
-            except Exception as e:
-                st.error("Could not save job.")
-                st.exception(e)
+                records.append(record)
+
+            if not records:
+                st.error(
+                    "There are no complete rows to save."
+                )
+
+            else:
+                try:
+                    insert_jobs(records)
+
+                    st.success(
+                        f"Saved {len(records)} job record(s)."
+                    )
+
+                    st.session_state.pop(
+                        "detected_jobs",
+                        None,
+                    )
+
+                    st.session_state.pop(
+                        "original_requirement",
+                        None,
+                    )
+
+                except Exception as error:
+                    st.error(
+                        "Could not save the records. "
+                        "Confirm that you ran the "
+                        "v0.3 Supabase migration."
+                    )
+
+                    st.exception(error)
 
 
-# -----------------------------
-# View Jobs
-# -----------------------------
-elif menu == "View Jobs":
-    st.subheader("Saved Jobs")
+# =========================================================
+# Tally file preview
+# =========================================================
+
+elif menu == "Tally file preview":
+    st.subheader("Tally file preview")
+
+    st.info(
+        "Preview only: this version does not save Tally rows. "
+        "We will map the real columns after you provide the "
+        "one-month exports."
+    )
+
+    uploaded = st.file_uploader(
+        "Upload a Tally CSV or Excel file",
+        type=[
+            "csv",
+            "xlsx",
+        ],
+    )
+
+    if uploaded:
+        try:
+            sheets = read_uploaded_table(
+                uploaded
+            )
+
+            sheet_name = st.selectbox(
+                "Sheet",
+                list(sheets),
+            )
+
+            table = sheets[sheet_name]
+
+            detected_report = guess_report_type(
+                table.columns
+            )
+
+            st.write(
+                f"Detected report type: "
+                f"**{detected_report}**"
+            )
+
+            st.write(
+                f"Rows: **{len(table):,}** | "
+                f"Columns: **{len(table.columns)}**"
+            )
+
+            st.write(
+                "Columns found:",
+                [
+                    str(column)
+                    for column in table.columns
+                ],
+            )
+
+            st.dataframe(
+                table.head(100),
+                use_container_width=True,
+            )
+
+            preview_csv = (
+                table
+                .to_csv(index=False)
+                .encode("utf-8-sig")
+            )
+
+            st.download_button(
+                "Download this preview as CSV",
+                preview_csv,
+                file_name=(
+                    f"{sheet_name}_preview.csv"
+                ),
+                mime="text/csv",
+            )
+
+        except Exception as error:
+            st.error(
+                "Peter could not read this file."
+            )
+
+            st.exception(error)
+
+
+# =========================================================
+# View records
+# =========================================================
+
+elif menu == "View records":
+    st.subheader("Saved records")
 
     try:
-        df = load_jobs()
+        jobs = load_jobs()
 
-        if df.empty:
-            st.warning("No jobs saved yet.")
+        if jobs.empty:
+            st.info(
+                "No records saved yet."
+            )
+
         else:
-            display_cols = [
+            preferred_columns = [
                 "id",
                 "created_at",
                 "customer",
+                "product_name",
                 "requirement",
                 "quantity",
+                "selling_unit",
                 "width_cm",
                 "height_cm",
                 "material",
                 "process",
-                "item_name",
+                "components",
+                "production_method",
                 "cost_price",
                 "selling_price",
-                "profit",
-                "margin_percent",
-                "notes",
+                "record_source",
+                "review_status",
             ]
 
-            available_cols = [col for col in display_cols if col in df.columns]
-            st.dataframe(df[available_cols], use_container_width=True)
+            available_columns = [
+                column
+                for column in preferred_columns
+                if column in jobs.columns
+            ]
 
-    except Exception as e:
-        st.error("Could not load jobs.")
-        st.exception(e)
+            st.dataframe(
+                jobs[available_columns],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    except Exception as error:
+        st.error(
+            "Could not load records."
+        )
+
+        st.exception(error)
 
 
-# -----------------------------
-# Edit/Delete Jobs
-# -----------------------------
-elif menu == "Edit/Delete Jobs":
-    st.subheader("Edit or Delete Job")
+# =========================================================
+# Edit or delete records
+# =========================================================
+
+elif menu == "Edit/Delete record":
+    st.subheader(
+        "Edit or delete a record"
+    )
 
     try:
-        df = load_jobs()
+        jobs = load_jobs()
 
-        if df.empty:
-            st.warning("No jobs saved yet.")
+        if jobs.empty:
+            st.info(
+                "No records saved yet."
+            )
+
         else:
-            job_options = [
-                f"{int(row['id'])} - {row.get('customer') or 'No customer'} - {row.get('requirement')}"
-                for _, row in df.iterrows()
+            options = {}
+
+            for _, row in jobs.iterrows():
+                record_id = int(row["id"])
+
+                customer_label = (
+                    display_text(
+                        row.get("customer")
+                    )
+                    or "No customer"
+                )
+
+                product_label = (
+                    display_text(
+                        row.get("product_name")
+                    )
+                    or display_text(
+                        row.get("requirement")
+                    )
+                )
+
+                label = (
+                    f"{record_id} — "
+                    f"{customer_label} — "
+                    f"{product_label}"
+                )
+
+                options[label] = record_id
+
+            selected_label = st.selectbox(
+                "Select record",
+                list(options),
+            )
+
+            selected_job_id = options[
+                selected_label
             ]
 
-            selected_job = st.selectbox("Select job", job_options)
-            selected_job_id = int(selected_job.split(" - ")[0])
-            job = df[df["id"] == selected_job_id].iloc[0]
+            job = jobs[
+                jobs["id"] == selected_job_id
+            ].iloc[0]
 
-            with st.form("edit_job_form"):
-                customer = st.text_input("Customer", value=job.get("customer") or "")
-                requirement = st.text_area("Requirement", value=job.get("requirement") or "", height=100)
+            with st.form("edit_record"):
+                customer = st.text_input(
+                    "Customer",
+                    value=display_text(
+                        job.get("customer")
+                    ),
+                )
+
+                product = st.text_input(
+                    "Sold item",
+                    value=display_text(
+                        job.get("product_name")
+                    ),
+                )
+
+                description = st.text_area(
+                    "Description",
+                    value=display_text(
+                        job.get("requirement")
+                    ),
+                )
 
                 quantity = st.number_input(
                     "Quantity",
                     min_value=0.0,
-                    value=to_float(job.get("quantity")),
-                    step=1.0,
+                    value=display_number(
+                        job.get("quantity")
+                    ),
                 )
 
-                col1, col2 = st.columns(2)
+                selling_units = [
+                    "pcs",
+                    "sqm",
+                    "roll",
+                    "sheet",
+                    "running metre",
+                    "job",
+                ]
 
-                with col1:
-                    width_input = st.text_input(
-                        "Width",
-                        value=format_measurement(job.get("width_cm"), "cm"),
-                        placeholder="Example: 10cm, 100mm, 1mtr",
+                current_unit = (
+                    display_text(
+                        job.get("selling_unit")
                     )
-
-                with col2:
-                    height_input = st.text_input(
-                        "Height",
-                        value=format_measurement(job.get("height_cm"), "cm"),
-                        placeholder="Example: 10cm, 100mm, 1mtr",
-                    )
-
-                thickness_input = st.text_input(
-                    "Thickness",
-                    value=format_measurement(job.get("thickness_mm"), "mm"),
-                    placeholder="Example: 3mm",
+                    or "job"
                 )
 
-                width_cm = parse_measurement(width_input, output_unit="cm", default_unit="cm")
-                height_cm = parse_measurement(height_input, output_unit="cm", default_unit="cm")
-                thickness_mm = parse_measurement(thickness_input, output_unit="mm", default_unit="mm")
-
-                material = st.text_input("Material", value=job.get("material") or "")
-                process = st.text_input("Process", value=job.get("process") or "")
-
-                production_options = ["In-house", "Outsourced", "Mixed", "Unknown"]
-                current_production = job.get("production_method") or "Unknown"
-
-                production_method = st.selectbox(
-                    "Production method",
-                    production_options,
-                    index=production_options.index(current_production)
-                    if current_production in production_options
-                    else 3,
+                unit_index = (
+                    selling_units.index(
+                        current_unit
+                    )
+                    if current_unit
+                    in selling_units
+                    else 5
                 )
 
-                vendor = st.text_input("Vendor / supplier", value=job.get("vendor") or "")
-
-                col3, col4 = st.columns(2)
-
-                with col3:
-                    cost_price = st.number_input(
-                        "Cost price OMR",
-                        min_value=0.0,
-                        value=to_float(job.get("cost_price")),
-                        step=0.100,
-                        format="%.3f",
-                    )
-
-                with col4:
-                    selling_price = st.number_input(
-                        "Selling price OMR",
-                        min_value=0.0,
-                        value=to_float(job.get("selling_price")),
-                        step=0.100,
-                        format="%.3f",
-                    )
-
-                notes = st.text_area("Notes", value=job.get("notes") or "")
-
-                confirm_delete = st.checkbox("I understand: delete this job permanently")
-
-                col_update, col_delete = st.columns(2)
-
-                with col_update:
-                    update_button = st.form_submit_button("Update Job")
-
-                with col_delete:
-                    delete_button = st.form_submit_button("Delete Job")
-
-            if update_button:
-                profit, margin_percent, markup_percent = calculate_profit(
-                    cost_price, selling_price
+                selling_unit = st.selectbox(
+                    "Selling unit",
+                    selling_units,
+                    index=unit_index,
                 )
-                area_sqm = calculate_area_sqm(width_cm, height_cm, quantity)
+
+                material = st.text_input(
+                    "Material",
+                    value=display_text(
+                        job.get("material")
+                    ),
+                )
+
+                process = st.text_input(
+                    "Process",
+                    value=display_text(
+                        job.get("process")
+                    ),
+                )
+
+                components = st.text_input(
+                    "Internal components",
+                    value=display_text(
+                        job.get("components")
+                    ),
+                )
+
+                cost = st.number_input(
+                    "Known cost OMR",
+                    min_value=0.0,
+                    value=display_number(
+                        job.get("cost_price")
+                    ),
+                    format="%.3f",
+                )
+
+                selling = st.number_input(
+                    "Selling price OMR",
+                    min_value=0.0,
+                    value=display_number(
+                        job.get("selling_price")
+                    ),
+                    format="%.3f",
+                )
+
+                notes = st.text_area(
+                    "Notes",
+                    value=display_text(
+                        job.get("notes")
+                    ),
+                )
+
+                status_options = [
+                    "Ready",
+                    "Needs review",
+                ]
+
+                current_status = (
+                    display_text(
+                        job.get("review_status")
+                    )
+                    or "Needs review"
+                )
+
+                status_index = (
+                    status_options.index(
+                        current_status
+                    )
+                    if current_status
+                    in status_options
+                    else 1
+                )
+
+                review_status = st.selectbox(
+                    "Review status",
+                    status_options,
+                    index=status_index,
+                )
+
+                confirm_delete = st.checkbox(
+                    "Confirm permanent deletion"
+                )
+
+                update_clicked = (
+                    st.form_submit_button(
+                        "Update record"
+                    )
+                )
+
+                delete_clicked = (
+                    st.form_submit_button(
+                        "Delete record"
+                    )
+                )
+
+            if update_clicked:
+                cost_value = safe_number(cost)
+                selling_value = safe_number(
+                    selling
+                )
+
+                profit = None
+                margin = None
+                markup = None
+
+                if (
+                    cost_value is not None
+                    and selling_value is not None
+                ):
+                    profit = (
+                        selling_value
+                        - cost_value
+                    )
+
+                    if selling_value:
+                        margin = (
+                            profit
+                            / selling_value
+                            * 100
+                        )
+
+                    if cost_value:
+                        markup = (
+                            profit
+                            / cost_value
+                            * 100
+                        )
 
                 updated_data = {
                     "customer": safe_text(customer),
-                    "requirement": requirement.strip(),
-                    "quantity": clean_number(quantity),
-                    "width_cm": clean_number(width_cm),
-                    "height_cm": clean_number(height_cm),
-                    "thickness_mm": clean_number(thickness_mm),
+                    "product_name": safe_text(
+                        product
+                    ),
+                    "requirement": safe_text(
+                        description
+                    ),
+                    "quantity": safe_number(
+                        quantity
+                    ),
+                    "selling_unit": selling_unit,
                     "material": safe_text(material),
                     "process": safe_text(process),
-                    "production_method": production_method,
-                    "vendor": safe_text(vendor),
-                    "cost_price": clean_number(cost_price),
-                    "selling_price": clean_number(selling_price),
+                    "components": safe_text(
+                        components
+                    ),
+                    "cost_price": cost_value,
+                    "selling_price": selling_value,
                     "profit": profit,
-                    "margin_percent": margin_percent,
-                    "markup_percent": markup_percent,
-                    "area_sqm": area_sqm,
+                    "margin_percent": margin,
+                    "markup_percent": markup,
                     "notes": safe_text(notes),
+                    "review_status": review_status,
                 }
 
-                update_job(selected_job_id, updated_data)
-                st.success("Job updated.")
+                update_job(
+                    selected_job_id,
+                    updated_data,
+                )
+
+                st.success(
+                    "Record updated."
+                )
+
                 st.rerun()
 
-            if delete_button:
+            if delete_clicked:
                 if confirm_delete:
-                    delete_job(selected_job_id)
-                    st.success("Job deleted.")
+                    delete_job(
+                        selected_job_id
+                    )
+
+                    st.success(
+                        "Record deleted."
+                    )
+
                     st.rerun()
+
                 else:
-                    st.error("Tick the delete confirmation checkbox first.")
+                    st.error(
+                        "Tick the deletion "
+                        "confirmation first."
+                    )
 
-    except Exception as e:
-        st.error("Could not edit/delete job.")
-        st.exception(e)
-
-
-# -----------------------------
-# Sticker Item Master
-# -----------------------------
-elif menu == "Sticker Item Master":
-    st.subheader("Add Sticker Item")
-
-    st.write("Use this for sticker rolls. Jarvis will convert roll cost into cost per sqm.")
-
-    with st.form("sticker_item_form"):
-        item_name = st.text_input("Item name", placeholder="Example: Mactac White Sticker")
-        brand = st.text_input("Brand", placeholder="Example: Mactac, 3M, Avery")
-        material_type = st.text_input("Material type", placeholder="Example: White sticker, Transparent, Reflective")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            roll_width_input = st.text_input(
-                "Roll width",
-                value="1.22m",
-                placeholder="Example: 1.22m, 122cm, 1220mm",
-            )
-
-        with col2:
-            roll_length_input = st.text_input(
-                "Roll length",
-                value="50m",
-                placeholder="Example: 50m, 5000cm",
-            )
-
-        roll_width_m = parse_measurement(roll_width_input, output_unit="m", default_unit="m")
-        roll_length_m = parse_measurement(roll_length_input, output_unit="m", default_unit="m")
-
-        col3, col4 = st.columns(2)
-
-        with col3:
-            roll_cost_omr = st.number_input(
-                "Roll cost OMR before VAT",
-                min_value=0.0,
-                value=0.0,
-                step=0.100,
-                format="%.3f",
-            )
-
-        with col4:
-            vat_percent = st.number_input(
-                "VAT %",
-                min_value=0.0,
-                value=5.0,
-                step=0.5,
-            )
-
-        col5, col6 = st.columns(2)
-
-        with col5:
-            extra_cost_omr = st.number_input(
-                "Extra cost OMR transport etc.",
-                min_value=0.0,
-                value=0.0,
-                step=0.100,
-                format="%.3f",
-            )
-
-        with col6:
-            wastage_percent = st.number_input(
-                "Roll wastage %",
-                min_value=0.0,
-                max_value=90.0,
-                value=10.0,
-                step=1.0,
-            )
-
-        landed, total_area, usable_area, cost_per_sqm = calculate_sticker_roll_cost(
-            roll_width_m,
-            roll_length_m,
-            roll_cost_omr,
-            vat_percent,
-            extra_cost_omr,
-            wastage_percent,
+    except Exception as error:
+        st.error(
+            "Could not edit or delete "
+            "the record."
         )
 
-        st.info(
-            f"Landed roll cost: {landed:.3f} OMR\n\n"
-            f"Total roll area: {total_area:.3f} sqm\n\n"
-            f"Usable area after wastage: {usable_area:.3f} sqm\n\n"
-            f"Cost per usable sqm: {cost_per_sqm:.3f} OMR"
-        )
+        st.exception(error)
 
-        col7, col8 = st.columns(2)
 
-        with col7:
-            default_selling_per_sqm = st.number_input(
-                "Default selling per sqm OMR",
-                min_value=0.0,
-                value=0.0,
-                step=0.100,
-                format="%.3f",
+# =========================================================
+# Export data
+# =========================================================
+
+elif menu == "Export data":
+    st.subheader("Export data")
+
+    try:
+        jobs = load_jobs()
+
+        if jobs.empty:
+            st.info(
+                "No records available to export."
             )
 
-        with col8:
-            minimum_selling_per_sqm = st.number_input(
-                "Minimum selling per sqm OMR",
-                min_value=0.0,
-                value=0.0,
-                step=0.100,
-                format="%.3f",
+        else:
+            csv_data = (
+                jobs
+                .to_csv(index=False)
+                .encode("utf-8-sig")
             )
-
-        machine = st.selectbox("Machine", ["Latex", "UV", "Other"])
-        production_method = st.selectbox("Production method", ["In-house", "Outsourced", "Mixed", "Unknown"])
-        notes = st.text_area("Notes optional")
-
-        submitted = st.form_submit_button("Save Sticker Item")
-
-    if submitted:
-        if not item_name.strip():
-            st.error("Item name is required.")
-        elif roll_width_m <= 0 or roll_length_m <= 0 or roll_cost_omr <= 0:
-            st.error("Roll width, roll length, and roll cost must be more than 0.")
-        else:
-            item_data = {
-                "created_at": datetime.now().isoformat(),
-                "item_name": item_name.strip(),
-                "category": "Sticker",
-                "brand": safe_text(brand),
-                "material_type": safe_text(material_type),
-                "purchase_unit": "Roll",
-                "roll_width_m": roll_width_m,
-                "roll_length_m": roll_length_m,
-                "roll_cost_omr": roll_cost_omr,
-                "vat_percent": vat_percent,
-                "extra_cost_omr": extra_cost_omr,
-                "wastage_percent": wastage_percent,
-                "landed_roll_cost_omr": landed,
-                "total_roll_area_sqm": total_area,
-                "usable_area_sqm": usable_area,
-                "cost_per_sqm": cost_per_sqm,
-                "default_selling_per_sqm": clean_number(default_selling_per_sqm),
-                "minimum_selling_per_sqm": clean_number(minimum_selling_per_sqm),
-                "machine": machine,
-                "production_method": production_method,
-                "notes": safe_text(notes),
-            }
-
-            try:
-                save_sticker_item(item_data)
-                st.success("Sticker item saved.")
-            except Exception as e:
-                st.error("Could not save sticker item.")
-                st.exception(e)
-
-
-# -----------------------------
-# Edit/Delete Sticker Items
-# -----------------------------
-elif menu == "Edit/Delete Sticker Items":
-    st.subheader("Edit or Delete Sticker Item")
-
-    try:
-        df = load_sticker_items()
-
-        if df.empty:
-            st.warning("No sticker items saved yet.")
-        else:
-            item_options = [
-                f"{int(row['id'])} - {row['item_name']}"
-                for _, row in df.iterrows()
-            ]
-
-            selected_item = st.selectbox("Select sticker item", item_options)
-            selected_item_id = int(selected_item.split(" - ")[0])
-            item = df[df["id"] == selected_item_id].iloc[0]
-
-            with st.form("edit_sticker_item_form"):
-                item_name = st.text_input("Item name", value=item.get("item_name") or "")
-                brand = st.text_input("Brand", value=item.get("brand") or "")
-                material_type = st.text_input("Material type", value=item.get("material_type") or "")
-
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    roll_width_input = st.text_input(
-                        "Roll width",
-                        value=format_measurement(item.get("roll_width_m"), "m"),
-                        placeholder="Example: 1.22m, 122cm, 1220mm",
-                    )
-
-                with col2:
-                    roll_length_input = st.text_input(
-                        "Roll length",
-                        value=format_measurement(item.get("roll_length_m"), "m"),
-                        placeholder="Example: 50m, 5000cm",
-                    )
-
-                roll_width_m = parse_measurement(roll_width_input, output_unit="m", default_unit="m")
-                roll_length_m = parse_measurement(roll_length_input, output_unit="m", default_unit="m")
-
-                col3, col4 = st.columns(2)
-
-                with col3:
-                    roll_cost_omr = st.number_input(
-                        "Roll cost OMR before VAT",
-                        min_value=0.0,
-                        value=to_float(item.get("roll_cost_omr")),
-                        step=0.100,
-                        format="%.3f",
-                    )
-
-                with col4:
-                    vat_percent = st.number_input(
-                        "VAT %",
-                        min_value=0.0,
-                        value=to_float(item.get("vat_percent"), 5.0),
-                        step=0.5,
-                    )
-
-                col5, col6 = st.columns(2)
-
-                with col5:
-                    extra_cost_omr = st.number_input(
-                        "Extra cost OMR",
-                        min_value=0.0,
-                        value=to_float(item.get("extra_cost_omr")),
-                        step=0.100,
-                        format="%.3f",
-                    )
-
-                with col6:
-                    wastage_percent = st.number_input(
-                        "Roll wastage %",
-                        min_value=0.0,
-                        max_value=90.0,
-                        value=to_float(item.get("wastage_percent"), 10.0),
-                        step=1.0,
-                    )
-
-                landed, total_area, usable_area, cost_per_sqm = calculate_sticker_roll_cost(
-                    roll_width_m,
-                    roll_length_m,
-                    roll_cost_omr,
-                    vat_percent,
-                    extra_cost_omr,
-                    wastage_percent,
-                )
-
-                st.info(
-                    f"Updated landed roll cost: {landed:.3f} OMR\n\n"
-                    f"Updated total area: {total_area:.3f} sqm\n\n"
-                    f"Updated usable area: {usable_area:.3f} sqm\n\n"
-                    f"Updated cost per usable sqm: {cost_per_sqm:.3f} OMR"
-                )
-
-                col7, col8 = st.columns(2)
-
-                with col7:
-                    default_selling_per_sqm = st.number_input(
-                        "Default selling per sqm OMR",
-                        min_value=0.0,
-                        value=to_float(item.get("default_selling_per_sqm")),
-                        step=0.100,
-                        format="%.3f",
-                    )
-
-                with col8:
-                    minimum_selling_per_sqm = st.number_input(
-                        "Minimum selling per sqm OMR",
-                        min_value=0.0,
-                        value=to_float(item.get("minimum_selling_per_sqm")),
-                        step=0.100,
-                        format="%.3f",
-                    )
-
-                machine_options = ["Latex", "UV", "Other"]
-                current_machine = item.get("machine") or "Latex"
-
-                machine = st.selectbox(
-                    "Machine",
-                    machine_options,
-                    index=machine_options.index(current_machine)
-                    if current_machine in machine_options
-                    else 0,
-                )
-
-                production_options = ["In-house", "Outsourced", "Mixed", "Unknown"]
-                current_production = item.get("production_method") or "In-house"
-
-                production_method = st.selectbox(
-                    "Production method",
-                    production_options,
-                    index=production_options.index(current_production)
-                    if current_production in production_options
-                    else 0,
-                )
-
-                notes = st.text_area("Notes", value=item.get("notes") or "")
-
-                confirm_delete = st.checkbox("I understand: delete this sticker item permanently")
-
-                col_update, col_delete = st.columns(2)
-
-                with col_update:
-                    update_button = st.form_submit_button("Update Sticker Item")
-
-                with col_delete:
-                    delete_button = st.form_submit_button("Delete Sticker Item")
-
-            if update_button:
-                updated_data = {
-                    "item_name": item_name.strip(),
-                    "brand": safe_text(brand),
-                    "material_type": safe_text(material_type),
-                    "roll_width_m": roll_width_m,
-                    "roll_length_m": roll_length_m,
-                    "roll_cost_omr": roll_cost_omr,
-                    "vat_percent": vat_percent,
-                    "extra_cost_omr": extra_cost_omr,
-                    "wastage_percent": wastage_percent,
-                    "landed_roll_cost_omr": landed,
-                    "total_roll_area_sqm": total_area,
-                    "usable_area_sqm": usable_area,
-                    "cost_per_sqm": cost_per_sqm,
-                    "default_selling_per_sqm": clean_number(default_selling_per_sqm),
-                    "minimum_selling_per_sqm": clean_number(minimum_selling_per_sqm),
-                    "machine": machine,
-                    "production_method": production_method,
-                    "notes": safe_text(notes),
-                }
-
-                update_sticker_item(selected_item_id, updated_data)
-                st.success("Sticker item updated.")
-                st.rerun()
-
-            if delete_button:
-                if confirm_delete:
-                    delete_sticker_item(selected_item_id)
-                    st.success("Sticker item deleted.")
-                    st.rerun()
-                else:
-                    st.error("Tick the delete confirmation checkbox first.")
-
-    except Exception as e:
-        st.error("Could not edit/delete sticker item.")
-        st.exception(e)
-
-
-# -----------------------------
-# Search Jobs
-# -----------------------------
-elif menu == "Search Jobs":
-    st.subheader("Search Jobs")
-
-    search = st.text_input("Search by customer, requirement, material, process, vendor, item, or notes")
-
-    try:
-        df = load_jobs()
-
-        if df.empty:
-            st.warning("No jobs saved yet.")
-        elif search.strip():
-            search_lower = search.lower()
-
-            filtered = df[
-                df.apply(
-                    lambda row: search_lower
-                    in " ".join([str(value).lower() for value in row.values]),
-                    axis=1,
-                )
-            ]
-
-            st.write(f"Found {len(filtered)} result(s).")
-            st.dataframe(filtered, use_container_width=True)
-        else:
-            st.info("Type something to search.")
-
-    except Exception as e:
-        st.error("Could not search jobs.")
-        st.exception(e)
-
-
-# -----------------------------
-# Export Data
-# -----------------------------
-elif menu == "Export Data":
-    st.subheader("Export Data")
-
-    try:
-        jobs_df = load_jobs()
-        sticker_df = load_sticker_items()
-
-        if jobs_df.empty:
-            st.warning("No jobs saved yet.")
-        else:
-            jobs_csv = jobs_df.to_csv(index=False).encode("utf-8")
 
             st.download_button(
-                label="Download Jobs CSV",
-                data=jobs_csv,
-                file_name="jarvis_jobs_export.csv",
+                "Download all records as CSV",
+                csv_data,
+                file_name=(
+                    "jarvis_job_records.csv"
+                ),
                 mime="text/csv",
             )
 
-            st.write("Jobs preview:")
-            st.dataframe(jobs_df, use_container_width=True)
-
-        st.markdown("---")
-
-        if sticker_df.empty:
-            st.warning("No sticker items saved yet.")
-        else:
-            sticker_csv = sticker_df.to_csv(index=False).encode("utf-8")
-
-            st.download_button(
-                label="Download Sticker Items CSV",
-                data=sticker_csv,
-                file_name="jarvis_sticker_items_export.csv",
-                mime="text/csv",
+            st.dataframe(
+                jobs,
+                use_container_width=True,
+                hide_index=True,
             )
 
-            st.write("Sticker items preview:")
-            st.dataframe(sticker_df, use_container_width=True)
+    except Exception as error:
+        st.error(
+            "Could not export records."
+        )
 
-    except Exception as e:
-        st.error("Could not export data.")
-        st.exception(e)
+        st.exception(error)
