@@ -725,7 +725,7 @@ def guess_report_type(columns):
 # =========================================================
 
 st.title("Jarvis")
-st.caption("Peter data collector v0.3.1")
+st.caption("Peter data collector v0.3.2")
 
 menu = st.sidebar.radio(
     "Menu",
@@ -801,6 +801,16 @@ if menu == "Add job records":
             use_container_width=True,
             hide_index=True,
             column_config={
+                "cost_price": st.column_config.NumberColumn(
+    "Total cost OMR",
+    min_value=0.0,
+    format="%.3f",
+),
+"selling_price": st.column_config.NumberColumn(
+    "Total selling OMR",
+    min_value=0.0,
+    format="%.3f",
+),
                 "description": st.column_config.TextColumn(
                     "Detected description",
                     required=True,
@@ -1274,12 +1284,12 @@ elif menu == "Edit/Delete record":
                         width="large",
                     ),
                     "cost_price": st.column_config.NumberColumn(
-                        "Cost OMR",
+                        "Total Cost OMR",
                         min_value=0.0,
                         format="%.3f",
                     ),
                     "selling_price": st.column_config.NumberColumn(
-                        "Selling OMR",
+                        "Total Selling OMR",
                         min_value=0.0,
                         format="%.3f",
                     ),
