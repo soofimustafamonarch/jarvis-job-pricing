@@ -725,7 +725,7 @@ def guess_report_type(columns):
 # =========================================================
 
 st.title("Jarvis")
-st.caption("Peter data collector v0.3 preview")
+st.caption("Peter data collector v0.3.1")
 
 menu = st.sidebar.radio(
     "Menu",
@@ -1162,311 +1162,331 @@ elif menu == "View records":
 # =========================================================
 
 elif menu == "Edit/Delete record":
-    st.subheader(
-        "Edit or delete a record"
+    st.subheader("Edit or delete records")
+
+    st.write(
+        "Edit values directly inside the table. "
+        "Tick Delete only for records you want to remove."
     )
+
+    # Show a message after the page refreshes.
+    edit_message = st.session_state.pop(
+        "edit_records_message",
+        None,
+    )
+
+    if edit_message:
+        st.success(edit_message)
 
     try:
         jobs = load_jobs()
 
         if jobs.empty:
-            st.info(
-                "No records saved yet."
-            )
+            st.info("No records saved yet.")
 
         else:
-            options = {}
-
-            for _, row in jobs.iterrows():
-                record_id = int(row["id"])
-
-                customer_label = (
-                    display_text(
-                        row.get("customer")
-                    )
-                    or "No customer"
-                )
-
-                product_label = (
-                    display_text(
-                        row.get("product_name")
-                    )
-                    or display_text(
-                        row.get("requirement")
-                    )
-                )
-
-                label = (
-                    f"{record_id} — "
-                    f"{customer_label} — "
-                    f"{product_label}"
-                )
-
-                options[label] = record_id
-
-            selected_label = st.selectbox(
-                "Select record",
-                list(options),
-            )
-
-            selected_job_id = options[
-                selected_label
+            editable_columns = [
+                "id",
+                "customer",
+                "product_name",
+                "requirement",
+                "quantity",
+                "selling_unit",
+                "material",
+                "process",
+                "components",
+                "cost_price",
+                "selling_price",
+                "notes",
+                "review_status",
             ]
 
-            job = jobs[
-                jobs["id"] == selected_job_id
-            ].iloc[0]
+            # Add missing columns for older records.
+            for column in editable_columns:
+                if column not in jobs.columns:
+                    jobs[column] = None
 
-            with st.form("edit_record"):
-                customer = st.text_input(
-                    "Customer",
-                    value=display_text(
-                        job.get("customer")
-                    ),
+            editor_data = jobs[
+                editable_columns
+            ].copy()
+
+            # Convert numeric columns properly.
+            for column in [
+                "quantity",
+                "cost_price",
+                "selling_price",
+            ]:
+                editor_data[column] = pd.to_numeric(
+                    editor_data[column],
+                    errors="coerce",
                 )
 
-                product = st.text_input(
-                    "Sold item",
-                    value=display_text(
-                        job.get("product_name")
+            # Add deletion checkbox.
+            editor_data["delete"] = False
+
+            edited_records = st.data_editor(
+                editor_data,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                column_config={
+                    "id": st.column_config.NumberColumn(
+                        "ID",
+                        disabled=True,
                     ),
+                    "customer": st.column_config.TextColumn(
+                        "Customer",
+                    ),
+                    "product_name": st.column_config.TextColumn(
+                        "Sold item",
+                        required=True,
+                    ),
+                    "requirement": st.column_config.TextColumn(
+                        "Description",
+                        required=True,
+                        width="large",
+                    ),
+                    "quantity": st.column_config.NumberColumn(
+                        "Quantity",
+                        min_value=0.0,
+                    ),
+                    "selling_unit": (
+                        st.column_config.SelectboxColumn(
+                            "Unit",
+                            options=[
+                                "pcs",
+                                "sqm",
+                                "roll",
+                                "sheet",
+                                "running metre",
+                                "job",
+                            ],
+                        )
+                    ),
+                    "material": st.column_config.TextColumn(
+                        "Material",
+                    ),
+                    "process": st.column_config.TextColumn(
+                        "Process",
+                    ),
+                    "components": st.column_config.TextColumn(
+                        "Internal components",
+                        width="large",
+                    ),
+                    "cost_price": st.column_config.NumberColumn(
+                        "Cost OMR",
+                        min_value=0.0,
+                        format="%.3f",
+                    ),
+                    "selling_price": st.column_config.NumberColumn(
+                        "Selling OMR",
+                        min_value=0.0,
+                        format="%.3f",
+                    ),
+                    "notes": st.column_config.TextColumn(
+                        "Notes",
+                        width="large",
+                    ),
+                    "review_status": (
+                        st.column_config.SelectboxColumn(
+                            "Status",
+                            options=[
+                                "Ready",
+                                "Needs review",
+                            ],
+                        )
+                    ),
+                    "delete": st.column_config.CheckboxColumn(
+                        "Delete",
+                        help=(
+                            "Tick this only if you want "
+                            "to permanently delete the record."
+                        ),
+                        default=False,
+                    ),
+                },
+                key="records_table_editor",
+            )
+
+            delete_count = int(
+                edited_records["delete"].sum()
+            )
+
+            if delete_count:
+                st.warning(
+                    f"{delete_count} record(s) marked "
+                    f"for permanent deletion."
                 )
 
-                description = st.text_area(
-                    "Description",
-                    value=display_text(
-                        job.get("requirement")
-                    ),
+                confirm_deletion = st.checkbox(
+                    "I confirm the selected records "
+                    "should be permanently deleted"
                 )
 
-                quantity = st.number_input(
-                    "Quantity",
-                    min_value=0.0,
-                    value=display_number(
-                        job.get("quantity")
-                    ),
-                )
+            else:
+                confirm_deletion = False
 
-                selling_units = [
-                    "pcs",
-                    "sqm",
-                    "roll",
-                    "sheet",
-                    "running metre",
-                    "job",
+            if st.button(
+                "Save table changes",
+                type="primary",
+            ):
+                remaining_records = edited_records[
+                    edited_records["delete"] == False
                 ]
 
-                current_unit = (
-                    display_text(
-                        job.get("selling_unit")
-                    )
-                    or "job"
-                )
-
-                unit_index = (
-                    selling_units.index(
-                        current_unit
-                    )
-                    if current_unit
-                    in selling_units
-                    else 5
-                )
-
-                selling_unit = st.selectbox(
-                    "Selling unit",
-                    selling_units,
-                    index=unit_index,
-                )
-
-                material = st.text_input(
-                    "Material",
-                    value=display_text(
-                        job.get("material")
-                    ),
-                )
-
-                process = st.text_input(
-                    "Process",
-                    value=display_text(
-                        job.get("process")
-                    ),
-                )
-
-                components = st.text_input(
-                    "Internal components",
-                    value=display_text(
-                        job.get("components")
-                    ),
-                )
-
-                cost = st.number_input(
-                    "Known cost OMR",
-                    min_value=0.0,
-                    value=display_number(
-                        job.get("cost_price")
-                    ),
-                    format="%.3f",
-                )
-
-                selling = st.number_input(
-                    "Selling price OMR",
-                    min_value=0.0,
-                    value=display_number(
-                        job.get("selling_price")
-                    ),
-                    format="%.3f",
-                )
-
-                notes = st.text_area(
-                    "Notes",
-                    value=display_text(
-                        job.get("notes")
-                    ),
-                )
-
-                status_options = [
-                    "Ready",
-                    "Needs review",
+                invalid_records = remaining_records[
+                    remaining_records["requirement"]
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                    .eq("")
                 ]
 
-                current_status = (
-                    display_text(
-                        job.get("review_status")
+                if not invalid_records.empty:
+                    st.error(
+                        "Every saved record must have "
+                        "a description."
                     )
-                    or "Needs review"
-                )
 
-                status_index = (
-                    status_options.index(
-                        current_status
-                    )
-                    if current_status
-                    in status_options
-                    else 1
-                )
-
-                review_status = st.selectbox(
-                    "Review status",
-                    status_options,
-                    index=status_index,
-                )
-
-                confirm_delete = st.checkbox(
-                    "Confirm permanent deletion"
-                )
-
-                update_clicked = (
-                    st.form_submit_button(
-                        "Update record"
-                    )
-                )
-
-                delete_clicked = (
-                    st.form_submit_button(
-                        "Delete record"
-                    )
-                )
-
-            if update_clicked:
-                cost_value = safe_number(cost)
-                selling_value = safe_number(
-                    selling
-                )
-
-                profit = None
-                margin = None
-                markup = None
-
-                if (
-                    cost_value is not None
-                    and selling_value is not None
+                elif (
+                    delete_count > 0
+                    and not confirm_deletion
                 ):
-                    profit = (
-                        selling_value
-                        - cost_value
+                    st.error(
+                        "Confirm deletion before saving."
                     )
 
-                    if selling_value:
-                        margin = (
-                            profit
-                            / selling_value
-                            * 100
+                else:
+                    updated_count = 0
+                    deleted_count = 0
+
+                    with st.spinner(
+                        "Saving changes..."
+                    ):
+                        for _, row in (
+                            edited_records.iterrows()
+                        ):
+                            record_id = int(row["id"])
+
+                            if bool(row["delete"]):
+                                delete_job(record_id)
+                                deleted_count += 1
+                                continue
+
+                            cost_value = safe_number(
+                                row.get("cost_price")
+                            )
+
+                            selling_value = safe_number(
+                                row.get("selling_price")
+                            )
+
+                            profit = None
+                            margin = None
+                            markup = None
+
+                            if (
+                                cost_value is not None
+                                and selling_value is not None
+                            ):
+                                profit = (
+                                    selling_value
+                                    - cost_value
+                                )
+
+                                if selling_value:
+                                    margin = (
+                                        profit
+                                        / selling_value
+                                        * 100
+                                    )
+
+                                if cost_value:
+                                    markup = (
+                                        profit
+                                        / cost_value
+                                        * 100
+                                    )
+
+                            update_data = {
+                                "customer": safe_text(
+                                    row.get("customer")
+                                ),
+                                "product_name": safe_text(
+                                    row.get(
+                                        "product_name"
+                                    )
+                                ),
+                                "requirement": safe_text(
+                                    row.get("requirement")
+                                ),
+                                "quantity": safe_number(
+                                    row.get("quantity")
+                                ),
+                                "selling_unit": safe_text(
+                                    row.get(
+                                        "selling_unit"
+                                    )
+                                ),
+                                "material": safe_text(
+                                    row.get("material")
+                                ),
+                                "process": safe_text(
+                                    row.get("process")
+                                ),
+                                "components": safe_text(
+                                    row.get("components")
+                                ),
+                                "cost_price": cost_value,
+                                "selling_price": (
+                                    selling_value
+                                ),
+                                "profit": profit,
+                                "margin_percent": margin,
+                                "markup_percent": markup,
+                                "notes": safe_text(
+                                    row.get("notes")
+                                ),
+                                "review_status": (
+                                    safe_text(
+                                        row.get(
+                                            "review_status"
+                                        )
+                                    )
+                                    or "Needs review"
+                                ),
+                            }
+
+                            update_job(
+                                record_id,
+                                update_data,
+                            )
+
+                            updated_count += 1
+
+                    message = (
+                        f"Updated {updated_count} "
+                        f"record(s)."
+                    )
+
+                    if deleted_count:
+                        message += (
+                            f" Deleted {deleted_count} "
+                            f"record(s)."
                         )
 
-                    if cost_value:
-                        markup = (
-                            profit
-                            / cost_value
-                            * 100
-                        )
-
-                updated_data = {
-                    "customer": safe_text(customer),
-                    "product_name": safe_text(
-                        product
-                    ),
-                    "requirement": safe_text(
-                        description
-                    ),
-                    "quantity": safe_number(
-                        quantity
-                    ),
-                    "selling_unit": selling_unit,
-                    "material": safe_text(material),
-                    "process": safe_text(process),
-                    "components": safe_text(
-                        components
-                    ),
-                    "cost_price": cost_value,
-                    "selling_price": selling_value,
-                    "profit": profit,
-                    "margin_percent": margin,
-                    "markup_percent": markup,
-                    "notes": safe_text(notes),
-                    "review_status": review_status,
-                }
-
-                update_job(
-                    selected_job_id,
-                    updated_data,
-                )
-
-                st.success(
-                    "Record updated."
-                )
-
-                st.rerun()
-
-            if delete_clicked:
-                if confirm_delete:
-                    delete_job(
-                        selected_job_id
-                    )
-
-                    st.success(
-                        "Record deleted."
-                    )
+                    st.session_state[
+                        "edit_records_message"
+                    ] = message
 
                     st.rerun()
 
-                else:
-                    st.error(
-                        "Tick the deletion "
-                        "confirmation first."
-                    )
-
     except Exception as error:
         st.error(
-            "Could not edit or delete "
-            "the record."
+            "Could not edit the records."
         )
 
         st.exception(error)
-
-
-# =========================================================
-# Export data
-# =========================================================
 
 elif menu == "Export data":
     st.subheader("Export data")
