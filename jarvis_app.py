@@ -8,7 +8,11 @@ import streamlit as st
 from supabase import create_client
 
 from document_capture import render_document_capture_page, render_saved_documents_page
-from tally_importer import render_review_inbox_page, render_tally_import_page
+from tally_importer import (
+    render_review_inbox_page,
+    render_tally_data_page,
+    render_tally_import_page,
+)
 
 
 # =========================================================
@@ -737,6 +741,7 @@ menu = st.sidebar.radio(
         "Document OCR",
         "Saved documents",
         "Tally import",
+        "Tally data",
         "Review Inbox",
         "View records",
         "Edit/Delete record",
@@ -1055,6 +1060,14 @@ elif menu == "Saved documents":
 
 elif menu == "Tally import":
     render_tally_import_page(supabase)
+
+
+# =========================================================
+# Browse synchronized Tally records
+# =========================================================
+
+elif menu == "Tally data":
+    render_tally_data_page(supabase)
 
 
 # =========================================================

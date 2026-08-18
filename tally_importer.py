@@ -420,6 +420,343 @@ def render_tally_import_page(supabase):
     render_import_history(supabase)
 
 
+def _search_frame(dataframe, search_text):
+    if dataframe.empty or not search_text.strip():
+        return dataframe
+    needle = search_text.strip().lower()
+    return dataframe[
+        dataframe.apply(
+            lambda row: needle in " ".join(
+                "" if optional_value(value) is None else str(value).lower()
+                for value in row.values
+            ),
+            axis=1,
+        )
+    ]
+
+
+def _show_tally_table(dataframe, columns, search_text, file_name, key):
+    available = [column for column in columns if column in dataframe.columns]
+    visible = _search_frame(dataframe[available].copy(), search_text)
+    st.caption(f"Showing {len(visible)} record(s)")
+    st.dataframe(visible, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download this view as CSV",
+        data=visible.to_csv(index=False).encode("utf-8"),
+        file_name=file_name,
+        mime="text/csv",
+        key=key,
+    )
+
+
+def _stock_items_with_rates(stock_items, joined_lines, movements):
+    stock_view = stock_items.copy()
+    if stock_view.empty:
+        return stock_view
+
+    stock_view["latest_purchase_rate"] = None
+    stock_view["weighted_avg_purchase_rate"] = None
+    stock_view["last_supplier"] = None
+    stock_view["last_purchase_date"] = None
+    stock_view["latest_inward_rate"] = None
+
+    if not joined_lines.empty and "report_type" in joined_lines.columns:
+        purchases = joined_lines[joined_lines["report_type"] == "Purchase"].copy()
+        if not purchases.empty and "item_guid" in purchases.columns:
+            purchases["rate_number"] = pd.to_numeric(
+                purchases.get("rate"), errors="coerce"
+            )
+            purchases["quantity_number"] = pd.to_numeric(
+                purchases.get("quantity"), errors="coerce"
+            )
+            purchases["amount_number"] = pd.to_numeric(
+                purchases.get("amount"), errors="coerce"
+            )
+            purchases["date_sort"] = pd.to_datetime(
+                purchases.get("voucher_date"), errors="coerce"
+            )
+
+            latest = (
+                purchases.dropna(subset=["item_guid", "rate_number"])
+                .sort_values(["date_sort", "id"], na_position="first")
+                .groupby("item_guid", as_index=False)
+                .tail(1)
+            )
+            if not latest.empty:
+                latest = latest[
+                    ["item_guid", "rate_number", "party_name", "voucher_date"]
+                ].rename(
+                    columns={
+                        "rate_number": "latest_purchase_rate_new",
+                        "party_name": "last_supplier_new",
+                        "voucher_date": "last_purchase_date_new",
+                    }
+                )
+                stock_view = stock_view.merge(
+                    latest,
+                    left_on="tally_guid",
+                    right_on="item_guid",
+                    how="left",
+                )
+                stock_view["latest_purchase_rate"] = stock_view.pop(
+                    "latest_purchase_rate_new"
+                )
+                stock_view["last_supplier"] = stock_view.pop("last_supplier_new")
+                stock_view["last_purchase_date"] = stock_view.pop(
+                    "last_purchase_date_new"
+                )
+                stock_view = stock_view.drop(columns=["item_guid"], errors="ignore")
+
+            averages = []
+            for item_guid, group in purchases.dropna(subset=["item_guid"]).groupby(
+                "item_guid"
+            ):
+                valid = group[
+                    group["quantity_number"].notna()
+                    & group["amount_number"].notna()
+                    & (group["quantity_number"] != 0)
+                ]
+                quantity_total = valid["quantity_number"].abs().sum()
+                if quantity_total:
+                    averages.append(
+                        {
+                            "tally_guid": item_guid,
+                            "weighted_avg_purchase_rate_new": (
+                                valid["amount_number"].abs().sum() / quantity_total
+                            ),
+                        }
+                    )
+            if averages:
+                stock_view = stock_view.merge(
+                    pd.DataFrame(averages), on="tally_guid", how="left"
+                )
+                stock_view["weighted_avg_purchase_rate"] = stock_view.pop(
+                    "weighted_avg_purchase_rate_new"
+                )
+
+    if not movements.empty and "item_guid" in movements.columns:
+        inward = movements.copy()
+        inward["inward_rate_number"] = pd.to_numeric(
+            inward.get("inward_rate"), errors="coerce"
+        )
+        inward["period_sort"] = pd.to_datetime(
+            inward.get("period_end"), errors="coerce"
+        )
+        latest_inward = (
+            inward.dropna(subset=["item_guid", "inward_rate_number"])
+            .sort_values(["period_sort", "id"], na_position="first")
+            .groupby("item_guid", as_index=False)
+            .tail(1)[["item_guid", "inward_rate_number"]]
+            .rename(columns={"inward_rate_number": "latest_inward_rate_new"})
+        )
+        if not latest_inward.empty:
+            stock_view = stock_view.merge(
+                latest_inward,
+                left_on="tally_guid",
+                right_on="item_guid",
+                how="left",
+            )
+            stock_view["latest_inward_rate"] = stock_view.pop(
+                "latest_inward_rate_new"
+            )
+            stock_view = stock_view.drop(columns=["item_guid"], errors="ignore")
+
+    purchase_rates = pd.to_numeric(
+        stock_view["latest_purchase_rate"], errors="coerce"
+    )
+    inward_rates = pd.to_numeric(
+        stock_view["latest_inward_rate"], errors="coerce"
+    )
+    stock_view["latest_purchase_rate"] = purchase_rates
+    stock_view["latest_inward_rate"] = inward_rates
+    stock_view["weighted_avg_purchase_rate"] = pd.to_numeric(
+        stock_view["weighted_avg_purchase_rate"], errors="coerce"
+    )
+    stock_view["reference_cost_rate"] = purchase_rates.combine_first(inward_rates)
+    stock_view["rate_source"] = ""
+    stock_view.loc[stock_view["latest_purchase_rate"].notna(), "rate_source"] = (
+        "Latest purchase"
+    )
+    stock_view.loc[
+        stock_view["latest_purchase_rate"].isna()
+        & stock_view["latest_inward_rate"].notna(),
+        "rate_source",
+    ] = "Latest inward"
+    return stock_view
+
+
+def render_tally_data_page(supabase):
+    st.subheader("Tally data library")
+    st.caption(
+        "Browse and search everything synchronized from Tally. "
+        "Use Review Inbox to correct uncertain rows."
+    )
+
+    search_text = st.text_input(
+        "Search Tally data",
+        placeholder="Item, supplier, customer, voucher number, description...",
+    )
+
+    try:
+        stock_items = pd.DataFrame(load_all(supabase, "tally_stock_items", "item_name"))
+        vouchers = pd.DataFrame(load_all(supabase, "tally_vouchers", "voucher_date", desc=True))
+        voucher_lines = pd.DataFrame(load_all(supabase, "tally_voucher_lines", "id", desc=True))
+        movements = pd.DataFrame(load_all(supabase, "tally_stock_movement", "id", desc=True))
+        imports = pd.DataFrame(load_all(supabase, "tally_imports", "id", desc=True))
+
+        if vouchers.empty or voucher_lines.empty:
+            joined_lines = pd.DataFrame()
+        else:
+            voucher_columns = [
+                "voucher_key",
+                "report_type",
+                "voucher_date",
+                "voucher_type",
+                "voucher_number",
+                "party_name",
+                "reference_number",
+                "total_amount",
+                "tax_amount",
+                "is_active",
+            ]
+            available_voucher_columns = [
+                column for column in voucher_columns if column in vouchers.columns
+            ]
+            joined_lines = voucher_lines.merge(
+                vouchers[available_voucher_columns],
+                on="voucher_key",
+                how="left",
+            )
+
+        stock_view = _stock_items_with_rates(stock_items, joined_lines, movements)
+
+        tab_items, tab_purchase, tab_sales, tab_movement, tab_imports = st.tabs(
+            ["Stock items", "Purchases", "Sales", "Stock movement", "Import history"]
+        )
+
+        with tab_items:
+            if stock_view.empty:
+                st.info("No stock items imported yet.")
+            else:
+                _show_tally_table(
+                    stock_view,
+                    [
+                        "item_name",
+                        "base_unit",
+                        "additional_unit",
+                        "reference_cost_rate",
+                        "rate_source",
+                        "latest_purchase_rate",
+                        "weighted_avg_purchase_rate",
+                        "latest_inward_rate",
+                        "last_supplier",
+                        "last_purchase_date",
+                        "is_deleted",
+                        "last_synced_at",
+                    ],
+                    search_text,
+                    "jarvis_tally_stock_items.csv",
+                    "download_tally_items",
+                )
+
+        voucher_view_columns = [
+            "voucher_date",
+            "voucher_number",
+            "party_name",
+            "item_name",
+            "quantity",
+            "unit",
+            "rate",
+            "amount",
+            "description",
+            "review_status",
+            "review_note",
+            "is_active",
+        ]
+        with tab_purchase:
+            purchase = (
+                joined_lines[joined_lines["report_type"] == "Purchase"]
+                if not joined_lines.empty and "report_type" in joined_lines.columns
+                else pd.DataFrame()
+            )
+            if purchase.empty:
+                st.info("No purchase records imported yet.")
+            else:
+                _show_tally_table(
+                    purchase,
+                    voucher_view_columns,
+                    search_text,
+                    "jarvis_tally_purchases.csv",
+                    "download_tally_purchases",
+                )
+
+        with tab_sales:
+            sales = (
+                joined_lines[joined_lines["report_type"] == "Sales"]
+                if not joined_lines.empty and "report_type" in joined_lines.columns
+                else pd.DataFrame()
+            )
+            if sales.empty:
+                st.info("No sales records imported yet.")
+            else:
+                _show_tally_table(
+                    sales,
+                    voucher_view_columns,
+                    search_text,
+                    "jarvis_tally_sales.csv",
+                    "download_tally_sales",
+                )
+
+        with tab_movement:
+            if movements.empty:
+                st.info("No stock movement records imported yet.")
+            else:
+                _show_tally_table(
+                    movements,
+                    [
+                        "period_start",
+                        "period_end",
+                        "item_name",
+                        "unit",
+                        "inward_quantity",
+                        "inward_rate",
+                        "inward_value",
+                        "outward_quantity",
+                        "outward_rate",
+                        "outward_value",
+                        "review_status",
+                        "is_active",
+                    ],
+                    search_text,
+                    "jarvis_tally_stock_movement.csv",
+                    "download_tally_movement",
+                )
+
+        with tab_imports:
+            if imports.empty:
+                st.info("No Tally imports yet.")
+            else:
+                _show_tally_table(
+                    imports,
+                    [
+                        "id",
+                        "imported_at",
+                        "file_name",
+                        "report_type",
+                        "period_start",
+                        "period_end",
+                        "record_count",
+                        "status",
+                    ],
+                    search_text,
+                    "jarvis_tally_import_history.csv",
+                    "download_tally_imports",
+                )
+    except Exception as error:
+        st.error("Could not load the Tally data library.")
+        st.exception(error)
+
+
 def _master_maps(stock_items):
     by_guid = {item["tally_guid"]: item for item in stock_items}
     by_name = {item["item_name"]: item for item in stock_items}

@@ -678,12 +678,82 @@ def save_document(supabase, draft, edited_lines):
 def recent_documents(supabase):
     response = (
         supabase.table("jarvis_documents")
-        .select("id,created_at,document_type,party_name,document_number,document_date,total_amount,review_status,file_name,storage_path")
+        .select("*")
         .order("id", desc=True)
-        .limit(50)
+        .limit(100)
         .execute()
     )
     return response.data or []
+
+
+def document_lines(supabase, document_id):
+    response = (
+        supabase.table("jarvis_document_lines")
+        .select("id,line_number,description,quantity,unit,rate,amount,review_status")
+        .eq("document_id", document_id)
+        .order("line_number")
+        .execute()
+    )
+    return response.data or []
+
+
+def update_saved_document(supabase, document_id, payload, edited_lines, original_lines):
+    supabase.table("jarvis_documents").update(payload).eq("id", document_id).execute()
+
+    original_ids = {int(row["id"]) for row in original_lines if row.get("id") is not None}
+    kept_ids = set()
+    new_rows = []
+
+    for _, row in edited_lines.iterrows():
+        description = optional_text(row.get("description"))
+        quantity = optional_float(row.get("quantity"))
+        rate = optional_float(row.get("rate"))
+        amount = optional_float(row.get("amount"))
+        unit = optional_text(row.get("unit"))
+        if not any([description, quantity is not None, rate is not None, amount is not None]):
+            continue
+
+        line_payload = {
+            "description": description,
+            "quantity": quantity,
+            "unit": unit,
+            "rate": rate,
+            "amount": amount,
+            "review_status": optional_text(row.get("review_status")) or "Needs review",
+        }
+        row_id = optional_float(row.get("id"))
+        if row_id is not None and int(row_id) in original_ids:
+            row_id = int(row_id)
+            kept_ids.add(row_id)
+            (
+                supabase.table("jarvis_document_lines")
+                .update(line_payload)
+                .eq("id", row_id)
+                .execute()
+            )
+        else:
+            new_rows.append({**line_payload, "document_id": document_id})
+
+    removed_ids = original_ids - kept_ids
+    for row_id in removed_ids:
+        supabase.table("jarvis_document_lines").delete().eq("id", row_id).execute()
+
+    if new_rows:
+        next_number = max(
+            [int(row.get("line_number") or 0) for row in original_lines] or [0]
+        ) + 1
+        for row in new_rows:
+            row["line_number"] = next_number
+            next_number += 1
+        supabase.table("jarvis_document_lines").insert(new_rows).execute()
+
+
+def delete_saved_document(supabase, record):
+    supabase.table("jarvis_documents").delete().eq("id", record["id"]).execute()
+    try:
+        supabase.storage.from_(BUCKET_NAME).remove([record["storage_path"]])
+    except Exception:
+        pass
 
 
 def signed_url(supabase, storage_path):
@@ -870,18 +940,146 @@ def render_saved_documents_page(supabase):
         ]
         st.dataframe(dataframe[visible], use_container_width=True, hide_index=True)
 
+        st.markdown("#### View or edit a document")
         options = [
             f"{row['id']} - {row['document_type']} - {row.get('file_name') or 'image'}"
             for row in rows
         ]
-        selected = st.selectbox("View original image", options)
+        selected = st.selectbox("Select document", options)
         selected_id = int(selected.split(" - ", 1)[0])
         record = next(row for row in rows if row["id"] == selected_id)
+        original_lines = document_lines(supabase, selected_id)
+
         url = signed_url(supabase, record["storage_path"])
         if url:
             st.link_button("Open private image (link valid for 5 minutes)", url)
         else:
             st.warning("Could not create the temporary image link.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            document_type = st.selectbox(
+                "Document type",
+                ["Purchase bill", "Sales invoice"],
+                index=0 if record.get("document_type") == "Purchase bill" else 1,
+                key=f"saved_type_{selected_id}",
+            )
+            party_name = st.text_input(
+                "Supplier / customer",
+                value=record.get("party_name") or "",
+                key=f"saved_party_{selected_id}",
+            )
+            document_number = st.text_input(
+                "Invoice / bill number",
+                value=record.get("document_number") or "",
+                key=f"saved_number_{selected_id}",
+            )
+        with col2:
+            document_date = st.text_input(
+                "Document date (YYYY-MM-DD)",
+                value=record.get("document_date") or "",
+                key=f"saved_date_{selected_id}",
+            )
+            currency_options = ["OMR", "AED", "USD", "EUR", "INR"]
+            saved_currency = record.get("currency") or "OMR"
+            currency = st.selectbox(
+                "Currency",
+                currency_options,
+                index=(
+                    currency_options.index(saved_currency)
+                    if saved_currency in currency_options
+                    else 0
+                ),
+                key=f"saved_currency_{selected_id}",
+            )
+            review_status = st.selectbox(
+                "Review status",
+                ["Needs review", "Ready"],
+                index=0 if record.get("review_status") != "Ready" else 1,
+                key=f"saved_status_{selected_id}",
+            )
+
+        col3, col4, col5 = st.columns(3)
+        with col3:
+            subtotal = st.text_input(
+                "Subtotal",
+                value="" if record.get("subtotal") is None else str(record["subtotal"]),
+                key=f"saved_subtotal_{selected_id}",
+            )
+        with col4:
+            vat_amount = st.text_input(
+                "VAT",
+                value="" if record.get("vat_amount") is None else str(record["vat_amount"]),
+                key=f"saved_vat_{selected_id}",
+            )
+        with col5:
+            total_amount = st.text_input(
+                "Total",
+                value="" if record.get("total_amount") is None else str(record["total_amount"]),
+                key=f"saved_total_{selected_id}",
+            )
+
+        line_columns = ["id", "description", "quantity", "unit", "rate", "amount", "review_status"]
+        line_frame = pd.DataFrame(original_lines, columns=line_columns)
+        edited_lines = st.data_editor(
+            line_frame,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            disabled=["id"],
+            column_config={
+                "id": st.column_config.NumberColumn("ID"),
+                "quantity": st.column_config.NumberColumn("Quantity", format="%.3f"),
+                "rate": st.column_config.NumberColumn("Rate", format="%.3f"),
+                "amount": st.column_config.NumberColumn("Amount", format="%.3f"),
+                "review_status": st.column_config.SelectboxColumn(
+                    "Status", options=["Needs review", "Ready", "Ignored"]
+                ),
+            },
+            key=f"saved_lines_{selected_id}",
+        )
+
+        notes = st.text_area(
+            "Notes",
+            value=record.get("notes") or "",
+            key=f"saved_notes_{selected_id}",
+        )
+
+        if st.button("Save document changes", type="primary", key=f"save_document_{selected_id}"):
+            payload = {
+                "document_type": document_type,
+                "party_name": optional_text(party_name),
+                "document_number": optional_text(document_number),
+                "document_date": parse_date_input(document_date),
+                "subtotal": optional_float(subtotal),
+                "vat_amount": optional_float(vat_amount),
+                "total_amount": optional_float(total_amount),
+                "currency": currency,
+                "review_status": review_status,
+                "notes": optional_text(notes),
+            }
+            update_saved_document(
+                supabase,
+                selected_id,
+                payload,
+                edited_lines,
+                original_lines,
+            )
+            st.success("Document changes saved.")
+            st.rerun()
+
+        confirm_delete = st.checkbox(
+            "I understand: permanently delete this document and its image",
+            key=f"confirm_document_delete_{selected_id}",
+        )
+        if st.button(
+            "Delete document",
+            disabled=not confirm_delete,
+            key=f"delete_document_{selected_id}",
+        ):
+            delete_saved_document(supabase, record)
+            st.success("Document deleted.")
+            st.rerun()
     except Exception as error:
         st.error("Could not load saved documents. Run the v0.5 Supabase migration first.")
         st.exception(error)
