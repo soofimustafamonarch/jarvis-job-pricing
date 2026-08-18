@@ -7,6 +7,9 @@ import pandas as pd
 import streamlit as st
 from supabase import create_client
 
+from document_capture import render_document_capture_page, render_saved_documents_page
+from tally_importer import render_review_inbox_page, render_tally_import_page
+
 
 # =========================================================
 # Page and login
@@ -725,13 +728,16 @@ def guess_report_type(columns):
 # =========================================================
 
 st.title("Jarvis")
-st.caption("Peter data collector v0.3.2")
+st.caption("Peter data collector v0.5")
 
 menu = st.sidebar.radio(
     "Menu",
     [
         "Add job records",
-        "Tally file preview",
+        "Document OCR",
+        "Saved documents",
+        "Tally import",
+        "Review Inbox",
         "View records",
         "Edit/Delete record",
         "Export data",
@@ -1031,7 +1037,39 @@ if menu == "Add job records":
 # Tally file preview
 # =========================================================
 
-elif menu == "Tally file preview":
+elif menu == "Document OCR":
+    render_document_capture_page(supabase)
+
+
+# =========================================================
+# Saved purchase bills and sales invoices
+# =========================================================
+
+elif menu == "Saved documents":
+    render_saved_documents_page(supabase)
+
+
+# =========================================================
+# Tally import
+# =========================================================
+
+elif menu == "Tally import":
+    render_tally_import_page(supabase)
+
+
+# =========================================================
+# Tally rows that need human confirmation
+# =========================================================
+
+elif menu == "Review Inbox":
+    render_review_inbox_page(supabase)
+
+
+# =========================================================
+# Previous preview page kept unreachable for rollback safety
+# =========================================================
+
+elif menu == "__old_tally_file_preview":
     st.subheader("Tally file preview")
 
     st.info(
