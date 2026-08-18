@@ -34,7 +34,14 @@ def optional_float(value):
     value = optional_value(value)
     if value is None:
         return None
-    return float(value)
+    if isinstance(value, str):
+        value = value.strip().replace(",", "")
+        if not value:
+            return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def chunked(rows, size=200):
@@ -43,11 +50,20 @@ def chunked(rows, size=200):
 
 
 def load_all(supabase, table_name, order_column=None, desc=False):
-    query = supabase.table(table_name).select("*")
-    if order_column:
-        query = query.order(order_column, desc=desc)
-    response = query.execute()
-    return response.data or []
+    rows = []
+    page_size = 1000
+    start = 0
+    while True:
+        query = supabase.table(table_name).select("*")
+        if order_column:
+            query = query.order(order_column, desc=desc)
+        response = query.range(start, start + page_size - 1).execute()
+        page = response.data or []
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        start += page_size
+    return rows
 
 
 def load_stock_items(supabase):

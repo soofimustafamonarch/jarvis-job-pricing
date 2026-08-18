@@ -8,6 +8,7 @@ import streamlit as st
 from supabase import create_client
 
 from document_capture import render_document_capture_page, render_saved_documents_page
+from job_calculator import render_job_calculator_page
 from tally_importer import (
     render_review_inbox_page,
     render_tally_data_page,
@@ -732,11 +733,12 @@ def guess_report_type(columns):
 # =========================================================
 
 st.title("Jarvis")
-st.caption("Peter data collector v0.5")
+st.caption("Peter job calculator and data library v0.6")
 
 menu = st.sidebar.radio(
     "Menu",
     [
+        "Job Calculator",
         "Add job records",
         "Document OCR",
         "Saved documents",
@@ -751,10 +753,18 @@ menu = st.sidebar.radio(
 
 
 # =========================================================
+# Job calculator
+# =========================================================
+
+if menu == "Job Calculator":
+    render_job_calculator_page(supabase)
+
+
+# =========================================================
 # Add job records
 # =========================================================
 
-if menu == "Add job records":
+elif menu == "Add job records":
     st.subheader("Add job records")
 
     st.write(
